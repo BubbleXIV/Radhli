@@ -1,0 +1,2072 @@
+class Attendance(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.events = {}
+        self.reminder_tasks = {}
+        self.cleanup_tasks = {}
+        self.pending_tasks = {}
+        self.recurring_tasks = {}
+        self.data_dir = "data"
+
+        # Set up all data storage
+        self.setup_data_storage()
+
+        # We'll load events when the bot is ready
+        self.bot.loop.create_task(self.load_all_events_when_ready())
+
+        # Start the check_events task
+        self.check_events.start()
+
+    async def cog_load(self):
+        """Called when the cog is loaded"""
+        print("Attendance cog loaded, setting up recurring events...")
+        self.bot.loop.create_task(self.setup_recurring_events())
+
+    async def setup_recurring_events(self):
+        """Set up recurring events after bot restart"""
+        print("Setting up recurring events...")
+        # Load all events
+        await self.load_events()
+        # Get all recurring events
+        recurring_events = {event_id: event for event_id, event in self.events.items()
+                            if event.get("recurring")}
+        print(f"Found {len(recurring_events)} recurring events")
+        # Schedule next occurrences for each recurring event
+        for event_id, event in recurring_events.items():
+            # Only schedule if the event hasn't happened yet
+            event_time_str = event.get("time")
+            if event_time_str:
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+                    now = datetime.now(pytz.UTC)
+                    # Calculate time difference
+                    time_diff = event_time - now
+                    # Check if this event already has a message
+                    if event.get("message_id"):
+                        print(f"Event {event_id} already has a message posted")
+                        # Store the last reminder time to prevent duplicate reminders on restart
+                        last_reminder_key = f"last_reminder_{event_id}"
+                        last_reminder_time = self.events.get(event_id, {}).get(last_reminder_key)
+                        # If the event is in the future, schedule its next occurrence
+                        if time_diff.total_seconds() > 0:
+                            print(f"Scheduling next occurrence for future event {event_id}")
+                            self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                                self.schedule_next_occurrence(event_id)
+                            )
+                        # If the event is in the past but less than 2 days ago, wait until 2 days have passed
+                        elif time_diff.total_seconds() > -2 * 24 * 60 * 60:
+                            print(f"Event {event_id} happened less than 2 days ago, waiting until 2 days have passed")
+                            # Check if we've already sent a reminder since the event
+                            if last_reminder_time:
+                                last_reminder = datetime.strptime(last_reminder_time, "%Y-%m-%d %H:%M")
+                                last_reminder = last_reminder.replace(tzinfo=pytz.UTC)
+                                # If we've already sent a reminder after the event, don't send another one
+                                if last_reminder > event_time:
+                                    print(f"Already sent a reminder for event {event_id} after it occurred")
+                                    continue
+
+                            wait_time = (2 * 24 * 60 * 60) + time_diff.total_seconds()
+
+                            # Create a task that waits and then schedules the next occurrence
+                            async def wait_and_schedule(event_id, wait_time):
+                                await asyncio.sleep(wait_time)
+                                # Record that we sent a reminder
+                                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime(
+                                    "%Y-%m-%d %H:%M")
+                                await self.save_events(
+                                    self.events[event_id].get("guild_id"))  # Save to persist this information
+                                await self.schedule_next_occurrence(event_id)
+
+                            # Create and store the task
+                            task = asyncio.create_task(wait_and_schedule(event_id, wait_time))
+                            self.pending_tasks[event_id] = task
+                except Exception as e:
+                    print(f"Error scheduling next occurrence for event {event_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    def calculate_next_occurrence(self, recurrence_rule, last_occurrence):
+        """Calculate the next occurrence based on the recurrence rule."""
+        try:
+            # Parse the recurrence rule
+            rrule_obj = rrulestr(recurrence_rule, dtstart=last_occurrence)
+
+            # Get the next occurrence after now
+            now = datetime.now(timezone.utc)
+            next_occurrences = list(rrule_obj.after(now, inc=False))
+
+            if not next_occurrences:
+                return None
+
+            return next_occurrences[0]
+        except Exception as e:
+            logger.error(f"Error calculating next occurrence: {e}")
+            return None
+
+
+    async def safe_respond(self, interaction, message, ephemeral=True):
+        """Safely respond to an interaction, handling cases where the interaction might have timed out"""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(message, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(message, ephemeral=ephemeral)
+        except discord.errors.NotFound:
+            # Interaction has expired or webhook is invalid
+            print(f"Could not respond to interaction - it may have expired")
+        except discord.errors.HTTPException as e:
+            print(f"HTTP Exception when responding to interaction: {e}")
+        except Exception as e:
+            print(f"Error responding to interaction: {e}")
+
+    async def get_event(self, guild_id, event_id):
+        """Safely get an event after ensuring events are loaded"""
+        await self.load_events(guild_id)
+        return self.events.get(event_id)
+
+    def setup_data_storage(self):
+        """Set up all necessary data directories and storage"""
+        try:
+            # Create the main data directory
+            os.makedirs(self.data_dir, exist_ok=True)
+
+            # Create the attendance data directory
+            attendance_dir = os.path.join(self.data_dir, "attendance")
+            os.makedirs(attendance_dir, exist_ok=True)
+
+            # Create the events directory
+            events_dir = os.path.join(self.data_dir, "events")
+            os.makedirs(events_dir, exist_ok=True)
+
+            # Initialize the attendance tracker
+            self.attendance_tracker = AttendanceTracker()
+
+            print("Data storage system initialized successfully")
+        except Exception as e:
+            print(f"Error setting up data storage: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def can_join_restricted_role(self, user, role_data):
+        """Check if a user can join a restricted role"""
+        # If the role isn't restricted, anyone can join
+        if not role_data.get("restricted", False):
+            return True
+
+        # Check if the role has a required role
+        required_role_id = role_data.get("required_role_id")
+        if not required_role_id:
+            return False
+
+        # Check if the user has the required role
+        for role in user.roles:
+            if str(role.id) == str(required_role_id):
+                return True
+
+        return False
+
+    def get_toggle_lock_key(self, user_id, event_id):
+        return f"{user_id}:{event_id}"
+
+    # Helper function for consistent datetime handling
+    async def parse_event_time(self, time_str):
+        try:
+            # Parse the input time string
+            naive_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+            # Convert EST to UTC for storage
+            est = timezone('US/Eastern')
+            est_time = est.localize(naive_time)
+            utc_time = est_time.astimezone(pytz.UTC)
+            # Return both the datetime object and formatted string
+            return utc_time, utc_time.strftime("%Y-%m-%d %H:%M")
+        except ValueError as e:
+            raise ValueError(f"Invalid time format: {e}")
+
+    async def on_interaction(self, interaction):
+        """Handle button interactions for attendance"""
+        if not interaction.data or not interaction.data.get("custom_id"):
+            return
+
+        custom_id = interaction.data["custom_id"]
+        if custom_id.startswith("attendance:"):
+            # Parse the custom ID to get event_id and role_id
+            parts = custom_id.split(":")
+            if len(parts) >= 4 and parts[3] == "toggle":
+                event_id = parts[1]
+                role_id = parts[2]
+
+                # Handle the role toggle directly
+                await self.toggle_role(interaction, event_id, role_id)
+
+    async def cancel_task_safely(self, task_dict, event_id):
+        """Safely cancel a task if it exists"""
+        if event_id in task_dict:
+            task = task_dict[event_id]
+            if not task.done() and not task.cancelled():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del task_dict[event_id]
+
+    def parse_time_input(self, time_str):
+        """Parse a time string input and convert to UTC"""
+        # Parse the input time string
+        naive_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        # Convert EST to UTC for storage
+        est = timezone('US/Eastern')
+        est_time = est.localize(naive_time)
+        utc_time = est_time.astimezone(pytz.UTC)
+        return utc_time
+
+    def format_time_for_display(self, utc_time_str):
+        """Format a UTC time string for display using Discord's timestamp feature"""
+        try:
+            # Parse the UTC time
+            utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+
+            # Get Unix timestamp for Discord's timestamp feature
+            unix_timestamp = int(utc_time.timestamp())
+
+            # Format with Discord timestamp (shows in user's local time)
+            discord_timestamp = f"<t:{unix_timestamp}:F>"  # F = Full date and time
+
+            # Also add relative time
+            relative_time = f"<t:{unix_timestamp}:R>"  # R = Relative time
+
+            return f"{discord_timestamp}\n({relative_time})"
+        except Exception as e:
+            print(f"Error formatting time: {e}")
+            # Fallback to EST formatting
+            utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            est = timezone('US/Eastern')
+            est_time = utc_time.astimezone(est)
+            return est_time.strftime("%Y-%m-%d %I:%M %p EST")
+
+    async def load_all_events_when_ready(self):
+        """Wait until the bot is ready, then load events for all guilds"""
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            try:
+                await self.load_events(guild.id)
+            except Exception as e:
+                print(f"Error loading events for guild {guild.id}: {e}")
+
+        # Check for missing message IDs
+        missing_count, total_count = await self.check_event_message_ids()
+
+        # Fix missing message IDs if needed
+        if missing_count > 0:
+            await self.fix_missing_message_ids()
+
+        # Fix recurring events with missing message IDs
+        await self.fix_recurring_events()
+
+        # Start any necessary tasks for loaded events
+        if hasattr(self, 'start_tasks_for_loaded_events'):
+            await self.start_tasks_for_loaded_events()
+
+    async def check_event_message_ids(self):
+        """Check all events for missing message IDs"""
+        print("Checking all events for missing message IDs...")
+        missing_count = 0
+        total_count = 0
+
+        for event_id, event in self.events.items():
+            total_count += 1
+            if 'message_id' not in event or not event['message_id']:
+                missing_count += 1
+                print(f"Event {event_id} is missing message_id")
+                # Print other event details to help debug
+                print(f"  Title: {event.get('title')}")
+                print(f"  Guild ID: {event.get('guild_id')}")
+                print(f"  Channel ID: {event.get('channel_id')}")
+
+        print(f"Found {missing_count} events with missing message IDs out of {total_count} total events")
+        return missing_count, total_count
+
+    async def fix_recurring_events(self):
+        """Fix recurring events that are missing message IDs"""
+        print("Checking for recurring events with missing message IDs...")
+        fixed_count = 0
+
+        for event_id, event in list(self.events.items()):
+            # Check if this is a recurring event with missing message_id
+            if event.get("recurring", False) and ('message_id' not in event or not event['message_id']):
+                print(f"Found recurring event {event_id} with missing message_id")
+
+                # Check if we have the channel info
+                if 'channel_id' in event and event['channel_id']:
+                    try:
+                        # Get the channel
+                        channel = self.bot.get_channel(int(event['channel_id']))
+                        if not channel:
+                            print(f"Channel {event['channel_id']} not found for event {event_id}")
+                            continue
+
+                        # Create a new embed and view
+                        embed = await self.create_event_embed(event_id)
+                        view = AttendanceView(self, event_id)
+
+                        # Send a new message
+                        message = await channel.send(embed=embed, view=view)
+
+                        # Update the event with the new message ID
+                        event['message_id'] = str(message.id)
+                        print(f"Fixed recurring event {event_id} with new message_id: {event['message_id']}")
+
+                        # Save the events
+                        await self.save_events(event['guild_id'])
+                        fixed_count += 1
+                    except Exception as e:
+                        print(f"Error fixing recurring event {event_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+        print(f"Fixed {fixed_count} recurring events with missing message IDs")
+        return fixed_count
+
+    async def fix_missing_message_ids(self):
+        """Fix any events with missing message IDs"""
+        print("Checking for events with missing message IDs...")
+        fixed_count = 0
+
+        for event_id, event in list(self.events.items()):  # Use list() to create a copy we can modify
+            if 'message_id' not in event or not event['message_id']:
+                print(f"Found event {event_id} with missing message_id")
+
+                # Check if we can recover the event
+                if 'channel_id' in event and event['channel_id']:
+                    try:
+                        # Get the channel
+                        channel = self.bot.get_channel(int(event['channel_id']))
+                        if not channel:
+                            print(f"Channel {event['channel_id']} not found for event {event_id}")
+                            continue
+
+                        # Create a new embed and view
+                        embed = await self.create_event_embed(event_id)
+                        view = AttendanceView(self, event_id)
+
+                        # Send a new message
+                        message = await channel.send(embed=embed, view=view)
+
+                        # Update the event with the new message ID
+                        event['message_id'] = str(message.id)
+                        print(f"Fixed event {event_id} with new message_id: {event['message_id']}")
+
+                        # Save the events
+                        await self.save_events(event['guild_id'])
+                        fixed_count += 1
+
+                    except Exception as e:
+                        print(f"Error fixing event {event_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"Cannot fix event {event_id} - missing channel_id")
+
+        print(f"Fixed {fixed_count} events with missing message IDs")
+        return fixed_count
+
+    async def start_tasks_for_loaded_events(self):
+        """Start tasks for all loaded events"""
+        now = datetime.now(pytz.UTC)
+        for event_id, event in self.events.items():
+            try:
+                # Parse the event time
+                event_time_str = event["time"]
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+
+                # Schedule reminder if the event is in the future
+                time_diff = event_time - now
+                if time_diff.total_seconds() > 0:
+                    self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                        self.send_reminder(event_id, time_diff)
+                    )
+
+                # Schedule cleanup for all events
+                cleanup_time = event_time + timedelta(days=1)
+                cleanup_diff = cleanup_time - now
+                if cleanup_diff.total_seconds() > 0:
+                    self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                        self.cleanup_event(event_id, cleanup_diff)
+                    )
+
+                # Schedule recurring tasks for recurring events
+                if event.get("recurring", False) and event_time > now:
+                    self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                        self.schedule_next_occurrence(event_id)
+                    )
+            except Exception as e:
+                print(f"Error starting tasks for event {event_id}: {e}")
+
+    async def assign_event_role(self, event_id, user_id):
+        """Safely assign an event role to a user"""
+        event = self.events.get(event_id)
+        if not event or not event.get("event_role_id"):
+            return False
+
+        guild = self.bot.get_guild(event["guild_id"])
+        if not guild:
+            return False
+
+        member = guild.get_member(int(user_id))
+        if not member:
+            return False
+
+        role = guild.get_role(event["event_role_id"])
+        if not role:
+            return False
+
+        try:
+            await member.add_roles(role, reason=f"Signed up for event: {event['title']}")
+            if str(user_id) not in event["event_role_users"]:
+                event["event_role_users"].append(str(user_id))
+            return True
+        except Exception as e:
+            print(f"Error assigning role: {e}")
+            return False
+
+    def cog_unload(self):
+        # Cancel all tasks when the cog is unloaded
+        self.check_events.cancel()
+        for task in self.reminder_tasks.values():
+            task.cancel()
+        for task in self.cleanup_tasks.values():
+            task.cancel()
+        for task in self.recurring_tasks.values():
+            task.cancel()
+
+    @tasks.loop(minutes=30)
+    async def check_events(self):
+        """Periodically check events for cleanup and recurring scheduling"""
+        now = datetime.now(pytz.UTC)
+        # Check each event
+        events_to_delete = []
+        for event_id, event in self.events.items():
+            event_time_str = event["time"]
+            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            # Check if event has passed and needs cleanup
+            if event_time < now - timedelta(days=1):
+                events_to_delete.append(event_id)
+            # Check if we need to schedule a recurring event
+            elif event.get("recurring", False) and event_time < now + timedelta(days=3):
+                # Check if this is the original event (not a recurring instance)
+                if event.get("original_event_id", event_id) == event_id and event_id not in self.recurring_tasks:
+                    # Schedule the next occurrence
+                    self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                        self.schedule_next_occurrence(event_id)
+                    )
+        # Delete old events
+        for event_id in events_to_delete:
+            await self.delete_event(event_id)
+
+    @check_events.before_loop
+    async def before_check_events(self):
+        await self.bot.wait_until_ready()
+
+    async def schedule_next_occurrence(self, event_id):
+        """Schedule the next occurrence of a recurring event"""
+        try:
+            # Get the event
+            event = self.events.get(event_id)
+            if not event:
+                print(f"Event {event_id} not found for scheduling next occurrence")
+                return
+            # Check if this is a recurring event
+            if not event.get("recurring"):
+                print(f"Event {event_id} is not recurring")
+                return
+            # Get the current event time
+            current_time_str = event.get("time")
+            if not current_time_str:
+                print(f"Event {event_id} has no time")
+                return
+            # Parse the current time
+            current_time = datetime.strptime(current_time_str, "%Y-%m-%d %H:%M")
+            current_time = current_time.replace(tzinfo=pytz.UTC)
+            # Calculate the next occurrence time
+            interval_weeks = event.get("recurring_interval", 1)
+            next_time = current_time + timedelta(weeks=interval_weeks)
+            # Only schedule if the next occurrence is in the future
+            now = datetime.now(pytz.UTC)
+            if next_time <= now:
+                print(f"Next occurrence of event {event_id} is in the past, adjusting...")
+                # Calculate how many intervals we need to add to get to the future
+                weeks_passed = (now - current_time).days // 7
+                additional_weeks = (weeks_passed // interval_weeks + 1) * interval_weeks
+                next_time = current_time + timedelta(weeks=additional_weeks)
+            # Check if we should wait until after the current event
+            # Only create the next occurrence if the current event has passed plus 2 days
+            time_until_current = current_time - now
+            if time_until_current.total_seconds() > 0:
+                # Current event hasn't happened yet
+                print(f"Current event {event_id} hasn't happened yet, waiting until 2 days after it occurs")
+                # Wait until 2 days after the current event
+                wait_time = time_until_current.total_seconds() + (2 * 24 * 60 * 60)  # Current event time + 2 days
+                await asyncio.sleep(wait_time)
+                # Re-run this function after waiting
+                self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                    self.schedule_next_occurrence(event_id)
+                )
+                return
+            elif time_until_current.total_seconds() > -2 * 24 * 60 * 60:
+                # Current event happened less than 2 days ago
+                print(f"Current event {event_id} happened less than 2 days ago, waiting until 2 days have passed")
+
+                # Check if we've already sent a reminder for this event
+                last_reminder_key = f"last_reminder_{event_id}"
+                if last_reminder_key in event:
+                    last_reminder_time = datetime.strptime(event[last_reminder_key], "%Y-%m-%d %H:%M")
+                    last_reminder_time = last_reminder_time.replace(tzinfo=pytz.UTC)
+
+                    # If we've already sent a reminder after the event, don't send another one
+                    if last_reminder_time > current_time:
+                        print(f"Already sent a reminder for event {event_id} after it occurred")
+                        # Still schedule the next occurrence
+                        self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                            self.schedule_next_occurrence(event_id)
+                        )
+                        return
+
+                # Calculate how much longer to wait
+                wait_time = (2 * 24 * 60 * 60) + time_until_current.total_seconds()
+                await asyncio.sleep(wait_time)
+
+                # Record that we sent a reminder
+                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+                await self.save_events(event.get("guild_id"))
+
+                # Re-run this function after waiting
+                self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                    self.schedule_next_occurrence(event_id)
+                )
+                return
+
+            # Check if an event for this next date already exists
+            next_time_str = next_time.strftime("%Y-%m-%d %H:%M")
+            guild_id = event.get("guild_id")
+            # Load all events for this guild to ensure we have the latest data
+            await self.load_events(guild_id)
+            # Check if an event with the same title and date already exists
+            for existing_id, existing_event in self.events.items():
+                if (existing_event.get("guild_id") == guild_id and
+                        existing_event.get("title") == event.get("title") and
+                        existing_event.get("time") == next_time_str):
+                    print(
+                        f"Event with title '{event.get('title')}' on {next_time_str} already exists, skipping creation")
+                    # Schedule this function to run again after the existing event
+                    existing_time = datetime.strptime(next_time_str, "%Y-%m-%d %H:%M")
+                    existing_time = existing_time.replace(tzinfo=pytz.UTC)
+                    wait_time = (existing_time - now).total_seconds() + (2 * 24 * 60 * 60)  # 2 days after event
+                    await asyncio.sleep(wait_time)
+                    # Re-run this function after waiting
+                    self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                        self.schedule_next_occurrence(event_id)
+                    )
+                    return
+
+            # Create a new event ID for the next occurrence
+            next_event_id = f"{event.get('title', '').replace(' ', '_')}_{next_time.strftime('%Y-%m-%d_%H-%M')}"
+            # Create a copy of the current event with the new time
+            next_event = event.copy()
+            next_event["id"] = next_event_id
+            next_event["time"] = next_time_str
+            next_event["message_id"] = None  # Will be set when the message is sent
+            # Reset the roles users
+            for role_id in next_event.get("roles", {}):
+                if "users" in next_event["roles"][role_id]:
+                    next_event["roles"][role_id]["users"] = []
+            # Save the new event
+            self.events[next_event_id] = next_event
+            await self.save_events(guild_id)
+            # Calculate when to post the event (3 days before it occurs)
+            time_to_next_event = next_time - now
+            posting_time = time_to_next_event.total_seconds() - (3 * 24 * 60 * 60)  # 3 days before event
+            if posting_time > 0:
+                # Wait until 3 days before the event to post it
+                print(f"Waiting {posting_time} seconds to post event {next_event_id} (3 days before it occurs)")
+                await asyncio.sleep(posting_time)
+            # Create and send the embed for the new event
+            guild = self.bot.get_guild(int(guild_id))
+            if not guild:
+                print(f"Guild {guild_id} not found for creating next occurrence")
+                return
+            channel = guild.get_channel(next_event.get("channel_id"))
+            if not channel:
+                print(f"Channel {next_event.get('channel_id')} not found for creating next occurrence")
+                return
+            embed = await self.create_event_embed(next_event_id)
+            view = AttendanceView(self, next_event_id)
+            message = await channel.send(embed=embed, view=view)
+            # Update the event with the message ID
+            self.events[next_event_id]["message_id"] = message.id
+            await self.save_events(guild_id)
+            print(f"Created next occurrence of event {event_id} as {next_event_id}")
+            # Schedule reminder for the new event
+            event_time_dt = next_time
+            time_diff = event_time_dt - datetime.now(pytz.UTC)
+            if time_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+                self.reminder_tasks[next_event_id] = self.bot.loop.create_task(
+                    self.send_reminder(next_event_id, time_diff)
+                )
+            # Schedule cleanup for the new event
+            cleanup_time = event_time_dt + timedelta(days=1)
+            cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
+            self.cleanup_tasks[next_event_id] = self.bot.loop.create_task(
+                self.cleanup_event(next_event_id, cleanup_diff)
+            )
+            # Schedule the next occurrence of this new event
+            self.recurring_tasks[next_event_id] = self.bot.loop.create_task(
+                self.schedule_next_occurrence(next_event_id)
+            )
+        except Exception as e:
+            print(f"Error scheduling next occurrence of event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def post_event_message(self, event_id, delay):
+        """Post an event message after a delay"""
+        try:
+            await asyncio.sleep(delay.total_seconds())
+
+            if event_id not in self.events:
+                print(f"Event {event_id} not found when trying to post message")
+                return
+
+            event = self.events[event_id]
+
+            # Check if the message has already been posted
+            if "message_id" in event and event["message_id"]:
+                print(f"Event {event_id} already has a message, skipping post")
+                return
+
+            # Get the channel
+            channel_id = event.get("channel_id")
+            if not channel_id:
+                print(f"Event {event_id} has no channel_id")
+                return
+
+            channel = self.bot.get_channel(int(channel_id))
+            if not channel:
+                print(f"Channel {channel_id} not found for event {event_id}")
+                return
+
+            # Create the embed and view
+            embed = await self.create_event_embed(event_id)
+            view = AttendanceView(self, event_id)
+
+            # Send the message
+            message = await channel.send(embed=embed, view=view)
+
+            # Update the event with the message ID
+            self.events[event_id]["message_id"] = str(message.id)
+
+            # Save the events
+            await self.save_events(event.get("guild_id"), update_message=False)
+
+            print(f"Posted message for event {event_id}: {message.id}")
+
+            # Schedule reminder for the event
+            event_time_str = event["time"]
+            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            reminder_diff = event_time - datetime.now(pytz.UTC)
+
+            if reminder_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+                self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                    self.send_reminder(event_id, reminder_diff)
+                )
+
+            # Schedule cleanup for the event (2 days after)
+            cleanup_time = event_time + timedelta(days=2)
+            cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
+            self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                self.cleanup_event(event_id, cleanup_diff)
+            )
+        except Exception as e:
+            print(f"Error posting event message: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def post_recurring_event(self, event_id, time_diff):
+        """Post a recurring event when it's time"""
+        try:
+            # Get the event
+            event = self.events.get(event_id)
+            if not event:
+                print(f"Event {event_id} not found")
+                return
+
+            # Get the event time
+            event_time_str = event.get("time")
+            if not event_time_str:
+                print(f"Event {event_id} has no time")
+                return
+
+            # Parse the event time
+            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+            event_time = event_time.replace(tzinfo=pytz.UTC)
+
+            # Calculate when to post (3 days before the event)
+            now = datetime.now(pytz.UTC)
+            time_to_event = event_time - now
+
+            # Wait until it's time to post the event (3 days before the event date)
+            posting_delay = time_to_event.total_seconds() - (3 * 24 * 60 * 60)  # 3 days in seconds
+            if posting_delay > 0:
+                print(f"Waiting {posting_delay} seconds to post event {event_id} (3 days before it occurs)")
+                await asyncio.sleep(posting_delay)
+
+            # Check if the event still exists
+            if event_id not in self.events:
+                return
+            event = self.events[event_id]
+
+            # Check if the message has already been posted
+            if event.get("message_id"):
+                print(f"Event {event_id} already has a message, skipping post")
+                return
+
+            # Check if a similar event already exists
+            event_time_str = event["time"]
+            event_title = event["title"]
+            duplicate_found = False
+            for existing_id, existing_event in self.events.items():
+                if existing_id != event_id and existing_event.get("title") == event_title and existing_event.get(
+                        "time") == event_time_str:
+                    print(f"Found duplicate event {existing_id} with same title and time, skipping creation")
+                    duplicate_found = True
+                    break
+
+            if duplicate_found:
+                # Delete this duplicate event
+                del self.events[event_id]
+                await self.save_events(event["guild_id"])
+                return
+
+            # Create the embed and view
+            embed = await self.create_event_embed(event_id)
+            view = AttendanceView(self, event_id)
+
+            # Send the message
+            channel = self.bot.get_channel(int(event["channel_id"]))
+            if not channel:
+                print(f"Channel {event['channel_id']} not found for recurring event {event_id}")
+                return
+
+            try:
+                message = await channel.send(embed=embed, view=view)
+                event["message_id"] = message.id
+                # Save the updated event
+                await self.save_events(event["guild_id"], update_message=False)
+
+                # Schedule reminder and cleanup for the new event
+                event_time_str = event["time"]
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                reminder_diff = event_time - datetime.now(pytz.UTC)
+                if reminder_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+                    self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                        self.send_reminder(event_id, reminder_diff)
+                    )
+
+                # Clean up 2 days after the event
+                cleanup_time = event_time + timedelta(days=2)
+                cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
+                self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                    self.cleanup_event(event_id, cleanup_diff)
+                )
+
+                # Schedule the next occurrence
+                await self.schedule_next_occurrence(event_id)
+            except Exception as e:
+                print(f"Error posting recurring event {event_id}: {e}")
+                import traceback
+                traceback.print_exc()
+        except Exception as e:
+            print(f"Error in post_recurring_event for {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def send_reminder(self, event_id, time_diff):
+        """Send a reminder for an event"""
+        try:
+            # Wait until 30 minutes before the event
+            reminder_time = time_diff.total_seconds() - 1800  # 30 minutes in seconds
+            print(f"Scheduling reminder for event {event_id} in {reminder_time} seconds")
+            if reminder_time > 0:
+                await asyncio.sleep(reminder_time)
+            print(f"Sending reminder for event {event_id}")
+
+            # Check if the event still exists
+            event = self.events.get(event_id)
+            if not event:
+                print(f"Event {event_id} no longer exists")
+                return
+
+            # Check if we've already sent a reminder for this event
+            last_reminder_key = f"last_reminder_{event_id}"
+            if last_reminder_key in event:
+                event_time = datetime.strptime(event.get("time"), "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                last_reminder_time = datetime.strptime(event[last_reminder_key], "%Y-%m-%d %H:%M")
+                last_reminder_time = last_reminder_time.replace(tzinfo=pytz.UTC)
+
+                # If we've already sent a reminder after the event was created, don't send another one
+                if last_reminder_time > event_time - timedelta(hours=1):  # Within 1 hour of event time
+                    print(f"Already sent a reminder for event {event_id} recently")
+                    return
+
+            # Get the guild and channel
+            guild = self.bot.get_guild(event["guild_id"])
+            if not guild:
+                print(f"Guild {event['guild_id']} not found for event {event_id}")
+                return
+            channel = guild.get_channel(event["channel_id"])
+            if not channel:
+                print(f"Channel {event['channel_id']} not found for event {event_id}")
+                return
+
+            # Get the message
+            try:
+                message = await channel.fetch_message(event["message_id"])
+                print(f"Found message for event {event_id}")
+            except Exception as e:
+                print(f"Error fetching message for event {event_id}: {e}")
+                return
+
+            # Create a thread for the event if it doesn't exist
+            thread = None
+            if not event.get("thread_id"):
+                try:
+                    print(f"Creating thread for event {event_id}")
+                    thread = await message.create_thread(
+                        name=f"Discussion: {event['title']}",
+                        auto_archive_duration=1440  # 24 hours
+                    )
+                    event["thread_id"] = thread.id
+                    await self.save_events(event["guild_id"])
+                    print(f"Thread created for event {event_id}: {thread.id}")
+                except Exception as e:
+                    print(f"Error creating thread for event {event_id}: {e}")
+                    # Continue without a thread
+                    return
+            else:
+                thread = channel.get_thread(event["thread_id"])
+                if not thread:
+                    print(f"Thread {event['thread_id']} not found for event {event_id}")
+                    # Continue without a thread
+                    return
+                else:
+                    print(f"Found existing thread for event {event_id}: {thread.id}")
+
+            # Format the reminder message
+            title = event.get('title', 'Untitled Event')
+            location = event.get('location', 'Not specified')
+            # Parse the event time
+            event_time_str = event.get('time', '')
+            try:
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                # Format as Discord timestamp for local time conversion
+                # This will show the time in each user's local timezone
+                discord_timestamp = f"<t:{int(event_time.timestamp())}:F>"
+                start_time = discord_timestamp
+            except ValueError:
+                start_time = event_time_str
+
+            # Build the reminder message
+            reminder_message = "Look alive! We start in 30 minutes!\n\n"
+            reminder_message += f"{title}\n"
+            reminder_message += f"Location: {location}\n"
+            reminder_message += f"Start time: {start_time}\n\n"
+
+            # Add pings section
+            pings = []
+            # First add the pingable role if it exists
+            if event.get("event_role_id"):
+                role = guild.get_role(event["event_role_id"])
+                if role:
+                    pings.append(role.mention)
+            # Then add individual user pings
+            for role_id, role_data in event["roles"].items():
+                for user_id in role_data.get("users", []):
+                    pings.append(f"<@{user_id}>")
+
+            # Add the pings to the message if there are any
+            if pings:
+                reminder_message += " ".join(pings)
+
+            # Send the reminder in the thread
+            try:
+                await thread.send(reminder_message)
+                print(f"Sent reminder for event {event_id} in thread")
+
+                # Record that we sent a reminder
+                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+                await self.save_events(event["guild_id"])
+
+            except Exception as e:
+                print(f"Error sending reminder in thread for event {event_id}: {e}")
+
+        except Exception as e:
+            print(f"Unexpected error in send_reminder for event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def cleanup_event(self, event_id):
+        """Clean up an event by removing its message and database entry."""
+        try:
+            # Get event data before deletion
+            event = await self.bot.db.events.find_one({"_id": event_id})
+            if not event:
+                return False
+
+            # Delete the event message if it exists
+            message_deleted = False
+            if "message_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        try:
+                            message = await channel.fetch_message(int(event.get("message_id")))
+                            await message.delete()
+                            message_deleted = True
+                        except discord.NotFound:
+                            # Message already deleted
+                            message_deleted = True
+                        except (discord.Forbidden, discord.HTTPException) as e:
+                            print(f"Error deleting message: {e}")
+                    else:
+                        print(f"Channel {event.get('channel_id')} not found")
+                except Exception as e:
+                    print(f"Error deleting event message: {e}")
+
+            # Delete the reminder thread if it exists
+            thread_deleted = False
+            if "reminder_thread_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        thread = channel.get_thread(int(event.get("reminder_thread_id")))
+                        if thread:
+                            await thread.delete()
+                            thread_deleted = True
+                        else:
+                            # Thread already deleted or not found
+                            thread_deleted = True
+                except Exception as e:
+                    print(f"Error deleting reminder thread: {e}")
+
+            # Delete the event from the database
+            result = await self.bot.db.events.delete_one({"_id": event_id})
+            db_deleted = result.deleted_count > 0
+
+            # If this was a recurring event, schedule the next occurrence
+            next_event_id = None
+            if event.get("recurring"):
+                next_event_id = await self.schedule_next_occurrence(event)
+
+            print(
+                f"Cleanup results - Message deleted: {message_deleted}, Thread deleted: {thread_deleted}, DB entry deleted: {db_deleted}, Next event created: {next_event_id is not None}")
+
+            return db_deleted
+        except Exception as e:
+            print(f"Error in cleanup_event: {e}")
+            traceback.print_exc()
+            return False
+
+    async def save_events(self, guild_id, update_message=False):
+        """Save events to the data directory"""
+        try:
+            guild_id = str(guild_id)
+            # Find all events for this guild
+            guild_events = {}
+            event_count = 0
+
+            for event_id, event in self.events.items():
+                if str(event.get("guild_id")) == guild_id:
+                    guild_events[event_id] = event
+                    event_count += 1
+
+                    # Debug output for message_id
+                    if "message_id" in event:
+                        print(
+                            f"Event {event.get('title', event_id)} has message_id: {event['message_id']} before saving")
+                    else:
+                        print(f"WARNING: Event {event.get('title', event_id)} is missing message_id before saving")
+
+            print(f"Saving {event_count} events for guild {guild_id}")
+
+            # Ensure the events directory exists
+            os.makedirs(os.path.join(self.data_dir, "events"), exist_ok=True)
+
+            # Save the events to a file
+            events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+
+            # Create a backup of the existing file if it exists
+            if os.path.exists(events_file):
+                backup_file = os.path.join(self.data_dir, "events", f"events_{guild_id}_backup.json")
+                try:
+                    shutil.copy2(events_file, backup_file)
+                    print(f"Created backup at: {backup_file}")
+                except Exception as e:
+                    print(f"Error creating backup: {e}")
+
+            # Save the events
+            with open(events_file, "w") as f:
+                json.dump(guild_events, f, indent=4)
+
+            print(f"Successfully saved events for guild {guild_id}")
+
+            # Verify the file was saved correctly
+            if os.path.exists(events_file):
+                file_size = os.path.getsize(events_file)
+                print(f"Verified file exists with size: {file_size} bytes")
+
+                # Verify message_ids were saved correctly
+                for event_id, event in guild_events.items():
+                    if "message_id" in event:
+                        print(
+                            f"Verified saved event {event.get('title', event_id)} has message_id: {event['message_id']}")
+                    else:
+                        print(f"WARNING: Event {event.get('title', event_id)} is missing message_id after saving")
+
+            # Update event messages if requested (but this should rarely be used)
+            if update_message:
+                for event_id, event in guild_events.items():
+                    await self.update_event_message(event_id)
+
+            return True
+        except Exception as e:
+            print(f"Error saving events: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def repair_events_file(self, guild_id):
+        """Repair the events file if it's corrupted or empty"""
+        events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+
+        # Check if file exists but is empty or corrupted
+        if os.path.exists(events_file):
+            try:
+                with open(events_file, "r") as f:
+                    content = f.read().strip()
+                    if not content or content == "{}":
+                        # File is empty or just contains {}, create a new one
+                        with open(events_file, "w") as f:
+                            json.dump({}, f)
+                        print(f"Repaired empty events file for guild {guild_id}")
+                    else:
+                        # Try to parse the JSON
+                        try:
+                            json.loads(content)
+                        except json.JSONDecodeError:
+                            # File is corrupted, create a new one
+                            with open(events_file, "w") as f:
+                                json.dump({}, f)
+                            print(f"Repaired corrupted events file for guild {guild_id}")
+            except Exception as e:
+                print(f"Error checking events file for guild {guild_id}: {e}")
+                # Create a new file
+                with open(events_file, "w") as f:
+                    json.dump({}, f)
+                print(f"Created new events file for guild {guild_id}")
+        else:
+            # Create the directory if it doesn't exist
+            os.makedirs(os.path.dirname(events_file), exist_ok=True)
+            # Create a new file
+            with open(events_file, "w") as f:
+                json.dump({}, f)
+            print(f"Created new events file for guild {guild_id}")
+
+    async def delete_event(self, event_id):
+        """Delete an event and clean up associated tasks"""
+        if event_id in self.events:
+            guild_id = self.events[event_id]["guild_id"]
+            # Cancel any scheduled tasks
+            await self.cancel_task_safely(self.reminder_tasks, event_id)
+            await self.cancel_task_safely(self.cleanup_tasks, event_id)
+            await self.cancel_task_safely(self.recurring_tasks, event_id)
+            # Remove the event from the dictionary
+            del self.events[event_id]
+            # Save the updated events
+            await self.save_events(guild_id)
+            return True
+        return False
+
+    async def load_events(self, guild_id=None):
+        """Load events from the data directory"""
+        try:
+            if guild_id is None:
+                print("Loading all events in attendance cog...")
+                self.events = {}
+                total_events = 0
+                # Ensure the events directory exists
+                os.makedirs(os.path.join(self.data_dir, "events"), exist_ok=True)
+                # Get all event files
+                event_files = glob.glob(os.path.join(self.data_dir, "events", "events_*.json"))
+                for event_file in event_files:
+                    try:
+                        # Extract guild ID from filename
+                        match = re.search(r"events_(\d+)\.json", os.path.basename(event_file))
+                        if match:
+                            file_guild_id = match.group(1)
+                            # Repair this file if needed
+                            await self.repair_events_file(file_guild_id)
+
+                            # Load events for this guild
+                            with open(event_file, "r") as f:
+                                file_content = f.read().strip()
+                                if not file_content or file_content == "{}":
+                                    print(f"File {event_file} contains empty JSON object")
+                                    continue
+                                guild_events = json.loads(file_content)
+                            # Check if guild_events is empty
+                            if not guild_events:
+                                print(f"No events found in {event_file}")
+                                continue
+                            # Add events to the main events dictionary
+                            for event_id, event_data in guild_events.items():
+                                self.events[event_id] = event_data
+                                total_events += 1
+                            print(f"Loaded {len(guild_events)} events for guild {file_guild_id}")
+                    except Exception as e:
+                        print(f"Error loading events from {event_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                print(f"Loaded a total of {total_events} events")
+                print("Events loaded successfully")
+                return True
+            else:
+                # Load events for a specific guild
+                guild_id = str(guild_id)
+
+                # Repair the events file if needed
+                await self.repair_events_file(guild_id)
+
+                events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+                if os.path.exists(events_file):
+                    try:
+                        with open(events_file, "r") as f:
+                            file_content = f.read().strip()
+                            if not file_content or file_content == "{}":
+                                print(f"File {events_file} contains empty JSON object")
+                                return True
+                            guild_events = json.loads(file_content)
+                        # Check if guild_events is empty
+                        if not guild_events:
+                            print(f"No events found in {events_file}")
+                            return True
+                        # Add events to the main events dictionary
+                        for event_id, event_data in guild_events.items():
+                            self.events[event_id] = event_data
+                        print(f"Loaded {len(guild_events)} events for guild {guild_id}")
+                        return True
+                    except Exception as e:
+                        print(f"Error loading events for guild {guild_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                else:
+                    print(f"No events file found for guild {guild_id}")
+                    return True  # Return True since this isn't an error
+        except Exception as e:
+            print(f"Error loading events: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def format_time_for_user(self, time_str):
+        """Format a UTC time string to a user-friendly format with Discord timestamp"""
+        try:
+            # Parse the UTC time
+            utc_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            # Get Unix timestamp for Discord's timestamp feature
+            unix_timestamp = int(utc_time.timestamp())
+            # Format with Discord timestamp (shows in user's local time)
+            discord_timestamp = f"<t:{unix_timestamp}:F>"  # F = Full date and time
+            # Also add relative time
+            relative_time = f"<t:{unix_timestamp}:R>"  # R = Relative time
+            return f"{discord_timestamp}\n({relative_time})"
+        except Exception as e:
+            print(f"Error formatting time: {e}")
+            return time_str
+
+    async def create_event_embed(self, event_id):
+        """Create an embed for an event"""
+        event = self.events[event_id]
+
+        # Get the event time string
+        event_time_str = event.get("time", "Unknown")
+
+        # Format the time using Discord's timestamp feature for local time display
+        try:
+            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            # Get Unix timestamp for Discord's timestamp feature
+            unix_timestamp = int(event_time.timestamp())
+            # Format with Discord timestamp (shows in user's local time)
+            time_str = f"<t:{unix_timestamp}:F>\n(<t:{unix_timestamp}:R>)"  # F = Full date and time, R = Relative time
+        except ValueError:
+            time_str = "Unknown Time"
+
+        embed = discord.Embed(
+            title=event["title"],
+            description=event["description"],
+            color=0x87CEEB  # Pastel blue color
+        )
+
+        embed.add_field(name="Time", value=time_str, inline=True)
+        embed.add_field(name="Location", value=event["location"], inline=True)
+
+        # Add fields for each role
+        for role_id, role_data in event.get("roles", {}).items():
+            role_name = role_data.get("name")
+            if not role_name:  # Skip roles with no name
+                continue
+
+            # Get the users in this role
+            users = role_data.get("users", [])
+            user_count = len(users)
+
+            # Create a list of user mentions
+            user_list = []
+            for user_id in users:
+                try:
+                    guild = self.bot.get_guild(int(event["guild_id"]))
+                    if guild:
+                        member = guild.get_member(int(user_id))
+                        if member:
+                            user_list.append(member.mention)
+                        else:
+                            user_list.append(f"<@{user_id}>")  # Fallback to mention format
+                    else:
+                        user_list.append(f"<@{user_id}>")  # Fallback to mention format
+                except Exception as e:
+                    print(f"Error getting member {user_id}: {e}")
+                    user_list.append(f"<@{user_id}>")  # Fallback to mention format
+
+            # Format the field value
+            if user_list:
+                # Join the user mentions with newlines, limit to 10 users to avoid hitting embed limits
+                displayed_users = user_list[:10]
+                remaining = user_count - 10 if user_count > 10 else 0
+
+                value = "\n".join(displayed_users)
+                if remaining > 0:
+                    value += f"\n*...and {remaining} more*"
+            else:
+                value = "*No users*"
+
+            # Add role limit if applicable
+            if "limit" in role_data and role_data["limit"] > 0:
+                field_name = f"{role_name} ({user_count}/{role_data['limit']})"
+            else:
+                field_name = f"{role_name} ({user_count})"
+
+            # Add restricted indicator if applicable
+            if role_data.get("restricted", False):
+                field_name += " 🔒"
+
+            embed.add_field(name=field_name, value=value, inline=False)
+
+        # Add footer with event ID for reference
+        embed.set_footer(text=f"Event ID: {event_id}")
+
+        return embed
+
+    async def setup_persistent_views(self):
+        """Set up persistent views for all events"""
+        try:
+            print("Setting up persistent views for attendance...")
+            # Load events first
+            await self.load_events()
+            # Create a view for each event
+            view_count = 0
+            for event_id, event in self.events.items():
+                try:
+                    # Check if the event has a message_id and channel_id
+                    if "message_id" in event and "channel_id" in event:
+                        # Create a new view
+                        view = AttendanceView(self, event_id)
+                        # Add the view
+                        self.bot.add_view(view, message_id=int(event["message_id"]))
+                        view_count += 1
+                        # DO NOT update the message here - just set up the view
+                except Exception as e:
+                    print(f"Error setting up view for event {event_id}: {e}")
+            print(f"Attendance views set up successfully: {view_count} views")
+        except Exception as e:
+            print(f"Error setting up persistent views: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def delete_all_events(self, guild_id):
+        """Delete all events for a guild"""
+        guild_id = str(guild_id)
+        # Find all events for this guild
+        events_to_delete = [event_id for event_id, event in self.events.items()
+                            if str(event.get("guild_id")) == guild_id]
+
+        # Delete each event
+        deleted_count = 0
+        for event_id in events_to_delete:
+            if await self.delete_event(event_id):
+                deleted_count += 1
+
+        return deleted_count
+
+    def can_bypass_signup_restrictions(self, member, guild):
+        """Check if a member can bypass signup restrictions"""
+        # Check if the bot has signup_bypass_roles attribute
+        if not hasattr(self.bot, 'signup_bypass_roles'):
+            return False
+        # Get the bypass roles for this guild
+        guild_id = str(guild.id)
+        bypass_role_ids = self.bot.signup_bypass_roles.get(guild_id, [])
+        # Check if the member has any of the bypass roles
+        for role in member.roles:
+            if str(role.id) in bypass_role_ids:
+                return True
+        return False
+
+    async def update_event_message(self, event_id):
+        """Update the event message with the latest information"""
+        try:
+            if event_id not in self.events:
+                print(f"Event {event_id} not found in self.events")
+                return False
+
+            event = self.events[event_id]
+            guild_id = event.get("guild_id")
+            channel_id = event.get("channel_id")
+            message_id = event.get("message_id")
+
+            # If message_id is missing, try to create a new message
+            if not message_id:
+                print(f"Event {event_id} is missing message_id, attempting to create a new message")
+                if channel_id:
+                    try:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            embed = await self.create_event_embed(event_id)
+                            view = AttendanceView(self, event_id)
+                            message = await channel.send(embed=embed, view=view)
+                            self.events[event_id]["message_id"] = str(message.id)
+                            await self.save_events(guild_id)
+                            print(f"Created new message for event {event_id}: {message.id}")
+                            return True
+                    except Exception as e:
+                        print(f"Error creating new message: {e}")
+                return False
+
+            if not all([guild_id, channel_id, message_id]):
+                print(
+                    f"Missing required data for event {event_id}: guild_id={guild_id}, channel_id={channel_id}, message_id={message_id}")
+                return False
+
+            # Get the guild, channel, and message
+            guild = self.bot.get_guild(int(guild_id))
+            if not guild:
+                print(f"Guild {guild_id} not found")
+                return False
+
+            channel = guild.get_channel(int(channel_id))
+            if not channel:
+                print(f"Channel {channel_id} not found in guild {guild_id}")
+                return False
+
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except discord.NotFound:
+                print(f"Message {message_id} not found in channel {channel_id}, creating new message")
+                try:
+                    embed = await self.create_event_embed(event_id)
+                    view = AttendanceView(self, event_id)
+                    message = await channel.send(embed=embed, view=view)
+                    self.events[event_id]["message_id"] = str(message.id)
+                    await self.save_events(guild_id)
+                    print(f"Created new message for event {event_id}: {message.id}")
+                    return True
+                except Exception as e:
+                    print(f"Error creating new message: {e}")
+                    return False
+            except Exception as e:
+                print(f"Error fetching message: {e}")
+                return False
+
+            # Create the updated embed
+            embed = await self.create_event_embed(event_id)
+
+            # Update the message
+            view = AttendanceView(self, event_id)
+            await message.edit(embed=embed, view=view)
+            print(f"Successfully updated message for event {event_id}")
+            return True
+        except Exception as e:
+            print(f"Error updating event message: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def create_event_view(self, event_id):
+        """Create a view for an event with role buttons"""
+        event = self.events.get(event_id)
+        if not event:
+            return None
+
+        view = discord.ui.View(timeout=None)
+
+        # Add buttons for each role
+        for role_id, role_data in event.get("roles", {}).items():
+            # Skip roles without names
+            if not role_data.get("name"):
+                continue
+
+            # Determine button style
+            style = discord.ButtonStyle.primary
+            if role_data.get("style") == "green":
+                style = discord.ButtonStyle.success
+            elif role_data.get("style") == "red":
+                style = discord.ButtonStyle.danger
+            elif role_data.get("style") == "gray":
+                style = discord.ButtonStyle.secondary
+
+            # Create the button
+            button = RoleButton(
+                cog=self,
+                event_id=event_id,
+                role_id=role_id,
+                label=role_data.get("name", "Unknown"),
+                style=style,
+                disabled=role_data.get("disabled", False),
+                required_role_id=role_data.get("required_role_id")
+            )
+            view.add_item(button)
+
+        return view
+
+    async def toggle_role(self, interaction, event_id, role_id):
+        """Toggle a user's role for an event with locking to prevent concurrent toggles"""
+        try:
+            print(f"Toggle role called for event_id: {event_id}, role_id: {role_id}")
+            # Create a unique lock key for this user and event
+            user_id = str(interaction.user.id)
+            # Initialize toggle_locks if it doesn't exist
+            if not hasattr(self, 'toggle_locks'):
+                self.toggle_locks = {}
+            lock_key = f"{user_id}:{event_id}"
+            # Check if there's already a toggle in progress for this user and event
+            if lock_key in self.toggle_locks:
+                # Already processing a toggle for this user and event
+                try:
+                    # Try to respond to the interaction
+                    await self.safe_respond(interaction,
+                                            "Please wait, your previous request is still processing.",
+                                            ephemeral=True
+                                            )
+                except Exception as e:
+                    print(f"Error responding to interaction: {e}")
+                return
+            # Set the lock
+            self.toggle_locks[lock_key] = True
+            # Acknowledge the interaction immediately if not already done
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True)
+            except Exception as e:
+                print(f"Error deferring interaction: {e}")
+            try:
+                # Get the guild ID and user ID
+                guild_id = str(interaction.guild.id)
+                member = interaction.guild.get_member(int(user_id))
+                # Check if the event exists
+                if event_id not in self.events:
+                    print(f"Event {event_id} not found in self.events")
+                    print(f"Available events: {list(self.events.keys())}")
+                    await self.safe_respond(interaction, "Event not found. Please contact an administrator.")
+                    return
+                # Get the event - make a copy to avoid race conditions
+                event = copy.deepcopy(self.events[event_id])
+                # Check if the role exists
+                if role_id not in event.get("roles", {}):
+                    await self.safe_respond(interaction, "Role not found.")
+                    return
+                # Get the role data
+                role_data = event["roles"][role_id]
+                role_name = role_data.get('name', 'Unknown Role')
+                # Check if the user can bypass restrictions
+                can_bypass = member and self.can_bypass_signup_restrictions(member, interaction.guild)
+                # Check if the role is restricted
+                if role_data.get("restricted", False) and not can_bypass:
+                    if not self.can_join_restricted_role(interaction.user, role_data):
+                        await self.safe_respond(interaction, "You don't have permission to join this role.")
+                        return
+                # Initialize the users list if it doesn't exist
+                if "users" not in role_data:
+                    role_data["users"] = []
+                # Check current state to determine action
+                currently_in_role = user_id in role_data["users"]
+                # Prepare response message
+                response_message = ""
+                # Initialize event_role_users if it doesn't exist
+                if "event_role_users" not in event:
+                    event["event_role_users"] = []
+
+                # First, check if user is in any other role and remove them
+                current_role_id = None
+                for other_role_id, other_role_data in event["roles"].items():
+                    if other_role_id != role_id and user_id in other_role_data.get("users", []):
+                        # Found user in another role, remove them
+                        current_role_id = other_role_id
+                        other_role_data["users"].remove(user_id)
+
+                        # Handle Discord role removal if applicable
+                        if "discord_role_id" in other_role_data and other_role_data["discord_role_id"]:
+                            try:
+                                discord_role = interaction.guild.get_role(int(other_role_data["discord_role_id"]))
+                                if discord_role and member:
+                                    await member.remove_roles(discord_role,
+                                                              reason=f"Removed from {event['title']} event role")
+                            except Exception as e:
+                                print(f"Error removing Discord role: {e}")
+
+                if currently_in_role:
+                    # REMOVE USER FROM ROLE (they clicked the same role again)
+                    role_data["users"].remove(user_id)
+                    response_message = f"You have left the {role_name} role."
+                    # Handle Discord role removal if applicable
+                    if "discord_role_id" in role_data and role_data["discord_role_id"]:
+                        try:
+                            discord_role = interaction.guild.get_role(int(role_data["discord_role_id"]))
+                            if discord_role and member:
+                                await member.remove_roles(discord_role,
+                                                          reason=f"Removed from {event['title']} event role")
+                        except Exception as e:
+                            print(f"Error removing Discord role: {e}")
+
+                    # Check if user is in any other roles for this event
+                    user_in_other_roles = False
+                    for other_role_id, other_role_data in event["roles"].items():
+                        if other_role_id != role_id and user_id in other_role_data.get("users", []):
+                            user_in_other_roles = True
+                            break
+
+                    # If not in any other roles, remove event role if it exists
+                    if not user_in_other_roles and event.get("event_role_id") and user_id in event.get(
+                            "event_role_users", []):
+                        try:
+                            event_role = interaction.guild.get_role(int(event["event_role_id"]))
+                            if event_role and member:
+                                await member.remove_roles(event_role,
+                                                          reason=f"Left all roles in event: {event['title']}")
+                                if user_id in event["event_role_users"]:
+                                    event["event_role_users"].remove(user_id)
+                        except Exception as e:
+                            print(f"Error removing event role: {e}")
+                else:
+                    # ADD USER TO ROLE
+                    # Check if the role has a limit
+                    if "limit" in role_data and role_data["limit"] > 0:
+                        # Check if the role is full
+                        if len(role_data["users"]) >= role_data["limit"] and not can_bypass:
+                            await self.safe_respond(interaction, f"The {role_name} role is full.")
+                            return
+                    # Add the user to the role
+                    role_data["users"].append(user_id)
+
+                    if current_role_id:
+                        previous_role_name = event["roles"][current_role_id].get('name', 'Unknown Role')
+                        response_message = f"You have switched from {previous_role_name} to {role_name}."
+                    else:
+                        response_message = f"You have joined the {role_name} role."
+
+                    # Add Discord role if applicable
+                    if "discord_role_id" in role_data and role_data["discord_role_id"]:
+                        try:
+                            discord_role = interaction.guild.get_role(int(role_data["discord_role_id"]))
+                            if discord_role and member:
+                                await member.add_roles(discord_role, reason=f"Joined {event['title']} event role")
+                        except Exception as e:
+                            print(f"Error adding Discord role: {e}")
+
+                    # Add event role if it exists and user isn't already in it
+                    if event.get("event_role_id") and user_id not in event.get("event_role_users", []):
+                        try:
+                            event_role = interaction.guild.get_role(int(event["event_role_id"]))
+                            if event_role and member:
+                                await member.add_roles(event_role, reason=f"Joined role in event: {event['title']}")
+                                event["event_role_users"].append(user_id)
+                        except Exception as e:
+                            print(f"Error adding event role: {e}")
+
+                # Update the event in the dictionary
+                self.events[event_id] = event
+                # Save the events
+                await self.save_events(guild_id, update_message=False)
+                # Update the message
+                await self.update_event_message(event_id)
+                # Respond to the interaction
+                await self.safe_respond(interaction, response_message)
+            finally:
+                # Always release the lock
+                if hasattr(self, 'toggle_locks') and lock_key in self.toggle_locks:
+                    del self.toggle_locks[lock_key]
+        except Exception as e:
+            print(f"Error toggling role: {e}")
+            import traceback
+            traceback.print_exc()
+            await self.safe_respond(interaction, "An error occurred. Please try again.")
+
+    @app_commands.command(name="create", description="Create a new attendance event")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def create_attendance(self, interaction: discord.Interaction):
+        """Create a new attendance event"""
+        # Load events for this guild if not already loaded
+        await self.load_events(interaction.guild.id)
+        await interaction.response.send_message("Let's create a new attendance event. I'll ask you some questions.",
+                                                ephemeral=True)
+        # Ask for title
+        await interaction.followup.send("What's the title of the event?", ephemeral=True)
+
+        # We need to wait for a message in the channel from this user
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+
+        try:
+            title_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            title = title_msg.content
+            # Delete the user's message to keep the channel clean
+            try:
+                await title_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for description
+        await interaction.followup.send("Please provide a description for the event:", ephemeral=True)
+        try:
+            desc_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            description = desc_msg.content
+            try:
+                await desc_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for time
+        await interaction.followup.send("When will the event take place? (Format: YYYY-MM-DD HH:MM in EST timezone)",
+                                        ephemeral=True)
+        while True:
+            try:
+                time_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                event_time_str = time_msg.content
+                # Validate time format
+                try:
+                    # Parse the input time string
+                    naive_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    # Convert EST to UTC for storage
+                    est = timezone('US/Eastern')
+                    est_time = est.localize(naive_time)
+                    utc_time = est_time.astimezone(pytz.UTC)
+                    # Store in UTC format
+                    event_time = utc_time.strftime("%Y-%m-%d %H:%M")
+                    try:
+                        await time_msg.delete()
+                    except:
+                        pass
+                    break
+                except ValueError as e:
+                    print(f"Time parsing error: {e}")
+                    await interaction.followup.send("Invalid time format. Please use YYYY-MM-DD HH:MM", ephemeral=True)
+                    try:
+                        await time_msg.delete()
+                    except:
+                        pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for location
+        await interaction.followup.send("Where will the event take place?", ephemeral=True)
+        try:
+            location_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            location = location_msg.content
+            try:
+                await location_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for channel
+        await interaction.followup.send(
+            f"Which channel should the event be posted in? Please enter the channel name, ID, or mention a channel.",
+            ephemeral=True)
+        while True:
+            try:
+                channel_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                # Check for channel mentions first
+                if channel_msg.channel_mentions:
+                    target_channel = channel_msg.channel_mentions[0]
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+                    break
+                # Try to find the channel by ID
+                try:
+                    channel_id = int(channel_msg.content.strip())
+                    target_channel = interaction.guild.get_channel(channel_id)
+                except ValueError:
+                    # If not an ID, try to find by name
+                    channel_name = channel_msg.content.strip().lower()
+                    target_channel = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+                if target_channel:
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+                    break
+                else:
+                    await interaction.followup.send(f"Channel not found in {interaction.guild.name}. Please try again.",
+                                                    ephemeral=True)
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for recurring
+        await interaction.followup.send("Should this event repeat? (yes/no)", ephemeral=True)
+        try:
+            recurring_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            recurring = recurring_msg.content.lower() in ["yes", "y", "true"]
+            try:
+                await recurring_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        recurring_interval = 0
+        if recurring:
+            # Ask for recurring interval
+            await interaction.followup.send(
+                "How often should it repeat? (Enter number of weeks: 1 for weekly, 2 for biweekly, etc.)",
+                ephemeral=True)
+            while True:
+                try:
+                    interval_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                    recurring_interval = int(interval_msg.content)
+                    if recurring_interval <= 0:
+                        await interaction.followup.send("Please enter a positive number.", ephemeral=True)
+                        try:
+                            await interval_msg.delete()
+                        except:
+                            pass
+                    else:
+                        try:
+                            await interval_msg.delete()
+                        except:
+                            pass
+                        break
+                except ValueError:
+                    await interaction.followup.send("Please enter a valid number.", ephemeral=True)
+                    try:
+                        await interval_msg.delete()
+                    except:
+                        pass
+                except asyncio.TimeoutError:
+                    return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Now set up the roles
+        roles = {}
+        # Get the restricted role IDs
+        restricted_role_ids = []
+        for i in range(4):  # Changed to 4 restricted roles as per requirements
+            await interaction.followup.send(
+                f"For restricted role #{i + 1}, please mention the role, enter its ID, or name (or type 'skip' to skip this restricted role):",
+                ephemeral=True)
+            try:
+                role_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                if role_msg.content.lower() == "skip":
+                    restricted_role_ids.append(None)
+                    try:
+                        await role_msg.delete()
+                    except:
+                        pass
+                    continue
+                # Check for role mentions first
+                if role_msg.role_mentions:
+                    role = role_msg.role_mentions[0]
+                    restricted_role_ids.append(role.id)
+                    await interaction.followup.send(f"Found role: {role.name}", ephemeral=True)
+                else:
+                    # Try to find the role by ID
+                    try:
+                        role_id = int(role_msg.content.strip())
+                        role = interaction.guild.get_role(role_id)
+                    except ValueError:
+                        # If not an ID, try to find by name
+                        role_name = role_msg.content.strip()
+                        role = discord.utils.get(interaction.guild.roles, name=role_name)
+                    if role:
+                        restricted_role_ids.append(role.id)
+                        await interaction.followup.send(f"Found role: {role.name}", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Role not found. Skipping this restricted role.",
+                                                        ephemeral=True)
+                        restricted_role_ids.append(None)
+                # Delete the user's message to keep the channel clean
+                try:
+                    await role_msg.delete()
+                except:
+                    pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Create roles (up to 10, with skippable options)
+        max_roles = 10
+        role_count = 0
+        # First handle restricted roles
+        for i in range(4):  # Changed to 4 restricted roles
+            # Skip if no required role was specified
+            if i >= len(restricted_role_ids) or restricted_role_ids[i] is None:
+                role_id = f"role_{i + 1}"
+                roles[role_id] = {
+                    "name": None,  # No name means this role is skipped
+                    "restricted": True,
+                    "users": [],
+                    "required_role_id": None
+                }
+                continue
+            await interaction.followup.send(f"Name for restricted role #{i + 1}:", ephemeral=True)
+            try:
+                role_name_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                role_name = role_name_msg.content
+                try:
+                    await role_name_msg.delete()
+                except:
+                    pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+            role_id = f"role_{i + 1}"
+            roles[role_id] = {
+                "name": role_name,
+                "restricted": True,
+                "users": [],
+                "required_role_id": restricted_role_ids[i]
+            }
+            role_count += 1
+
+        # Now handle open roles (6 open roles as per requirements)
+        for i in range(4, 4 + 6):  # 4 restricted + 6 open = 10 total
+            await interaction.followup.send(
+                f"Name for open role #{i + 1 - 4} (or type 'skip' to skip, or 'done' if you're finished adding roles):",
+                ephemeral=True)
+            try:
+                role_name_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                role_name = role_name_msg.content
+                try:
+                    await role_name_msg.delete()
+                except:
+                    pass
+                if role_name.lower() == "done":
+                    break
+                if role_name.lower() == "skip":
+                    role_id = f"role_{i + 1}"
+                    roles[role_id] = {
+                        "name": None,  # No name means this role is skipped
+                        "restricted": False,
+                        "users": [],
+                        "required_role_id": None
+                    }
+                    continue
+                role_id = f"role_{i + 1}"
+                roles[role_id] = {
+                    "name": role_name,
+                    "restricted": False,
+                    "users": [],
+                    "required_role_id": None
+                }
+                role_count += 1
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # NEW: Ask if a pingable role should be assigned to participants
+        await interaction.followup.send(
+            "Would you like to assign a pingable role to everyone who signs up for this event? (yes/no)",
+            ephemeral=True
+        )
+        try:
+            pingable_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            assign_pingable_role = pingable_msg.content.lower() in ["yes", "y", "true"]
+            try:
+                await pingable_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        event_role_id = None
+        if assign_pingable_role:
+            # Ask if they want to create a new role or use an existing one
+            await interaction.followup.send(
+                "Would you like to create a new role or use an existing one? (new/existing)",
+                ephemeral=True
+            )
+            try:
+                role_choice_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                create_new_role = role_choice_msg.content.lower() in ["new", "n", "create"]
+                try:
+                    await role_choice_msg.delete()
+                except:
+                    pass
+                if create_new_role:
+                    # Create a new role
+                    role_name = f"Event: {title}"
+                    new_role = await interaction.guild.create_role(
+                        name=role_name,
+                        mentionable=True,
+                        reason=f"Created for event: {title}"
+                    )
+                    event_role_id = new_role.id
+                    await interaction.followup.send(f"Created new role: {new_role.name}", ephemeral=True)
+                else:
+                    # Use an existing role
+                    await interaction.followup.send(
+                        "Please mention the role, enter its ID, or name:",
+                        ephemeral=True
+                    )
+                    try:
+                        existing_role_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                        # Check for role mentions first
+                        if existing_role_msg.role_mentions:
+                            role = existing_role_msg.role_mentions[0]
+                            event_role_id = role.id
+                            await interaction.followup.send(f"Using role: {role.name}", ephemeral=True)
+                        else:
+                            # Try to find the role by ID
+                            try:
+                                role_id = int(existing_role_msg.content.strip())
+                                role = interaction.guild.get_role(role_id)
+                            except ValueError:
+                                # If not an ID, try to find by name
+                                role_name = existing_role_msg.content.strip()
+                                role = discord.utils.get(interaction.guild.roles, name=role_name)
+                            if role:
+                                event_role_id = role.id
+                                await interaction.followup.send(f"Using role: {role.name}", ephemeral=True)
+                            else:
+                                await interaction.followup.send("Role not found. No pingable role will be assigned.",
+                                                                ephemeral=True)
+                                event_role_id = None
+                        try:
+                            await existing_role_msg.delete()
+                        except:
+                            pass
+                    except asyncio.TimeoutError:
+                        return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Create a unique event ID based on title and date
+        event_id = f"{title.replace(' ', '_')}_{naive_time.strftime('%Y-%m-%d_%H-%M')}"
+
+        # Create the event dictionary
+        event = {
+            "id": event_id,
+            "title": title,
+            "description": description,
+            "time": event_time,
+            "location": location,
+            "guild_id": interaction.guild.id,
+            "channel_id": target_channel.id,
+            "message_id": None,  # Will be updated after sending the message
+            "roles": roles,
+            "recurring": recurring,
+            "recurring_interval": recurring_interval,
+            "event_role_id": event_role_id,
+            "created_at": datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+        }
+
+        # Save the event to the dictionary BEFORE creating the view
+        self.events[event_id] = event
+
+        # Create the embed
+        embed = await self.create_event_embed(event_id)
+
+        # Debug output before saving
+        print(f"Creating event with ID: {event_id}")
+        print(f"Event data: {event}")
+        print(f"Current events dict has {len(self.events)} events")
+        print(f"Guild ID in event: {event['guild_id']}, Type: {type(event['guild_id'])}")
+
+        # Send the message with the view
+        view = AttendanceView(self, event_id)
+        message = await target_channel.send(embed=embed, view=view)
+
+        # Debug the message ID
+        print(f"Message sent with ID: {message.id}")
+
+        # Update the event with the message ID
+        self.events[event_id]["message_id"] = message.id
+        print(f"Updated event {event_id} with message_id: {self.events[event_id]['message_id']}")
+
+        # Make a copy of the event to verify it's saved correctly
+        event_copy = self.events[event_id].copy()
+
+        # Save the events
+        await self.save_events(interaction.guild.id)
+        print(f"Saved events for guild {interaction.guild.id}")
+
+        # Verify the message ID was saved by checking the actual saved data
+        # This is a critical step to ensure the message ID is persisted
+        events_file = os.path.join(self.data_dir, "events", f"events_{interaction.guild.id}.json")
+        if os.path.exists(events_file):
+            try:
+                with open(events_file, "r") as f:
+                    saved_events = json.load(f)
+                    if event_id in saved_events and 'message_id' in saved_events[event_id]:
+                        print(f"Verified saved message_id: {saved_events[event_id]['message_id']}")
+                    else:
+                        print(f"WARNING: message_id not found in saved event data!")
+                        # Try to fix it by saving again
+                        self.events[event_id] = event_copy  # Restore from our copy
+                        await self.save_events(interaction.guild.id)
+                        print(f"Attempted to fix by saving again")
+            except Exception as e:
+                print(f"Error verifying saved data: {e}")
+
+        # Schedule the reminder
+        event_time_dt = datetime.strptime(event_time, "%Y-%m-%d %H:%M")
+        event_time_dt = event_time_dt.replace(tzinfo=pytz.UTC)
+        time_diff = event_time_dt - datetime.now(pytz.UTC)
+
+        if time_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+            self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                self.send_reminder(event_id, time_diff)
+            )
+
+        # Schedule cleanup
+        cleanup_time = event_time_dt + timedelta(days=1)
+        cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
+        self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+            self.cleanup_event(event_id, cleanup_diff)
+        )
+
+        # If recurring, schedule the next occurrence
+        if recurring:
+            self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                self.schedule_next_occurrence(event_id)
+            )
+
+        # Confirm to the user
+        await interaction.followup.send(
+            f"Event created successfully! Check {target_channel.mention} to see your event.",
+            ephemeral=True
