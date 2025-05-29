@@ -1,0 +1,573 @@
+    async def send_reminder(self, event_id, time_diff):
+        """Send a reminder for an event"""
+        try:
+            # Wait until 30 minutes before the event
+            reminder_time = time_diff.total_seconds() - 1800  # 30 minutes in seconds
+            print(f"Scheduling reminder for event {event_id} in {reminder_time} seconds")
+            if reminder_time > 0:
+                await asyncio.sleep(reminder_time)
+
+            print(f"Sending reminder for event {event_id}")
+
+            # Check if the event still exists
+            event = self.events.get(event_id)
+            if not event:
+                print(f"Event {event_id} no longer exists")
+                return
+
+            # Check if we've already sent a reminder for this event
+            last_reminder_key = f"last_reminder_{event_id}"
+            if last_reminder_key in event:
+                try:
+                    event_time = datetime.strptime(event.get("time"), "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                    last_reminder_time = datetime.strptime(event[last_reminder_key], "%Y-%m-%d %H:%M")
+                    last_reminder_time = last_reminder_time.replace(tzinfo=pytz.UTC)
+
+                    # If we've already sent a reminder after the event was created, don't send another one
+                    if last_reminder_time > event_time - timedelta(hours=1):  # Within 1 hour of event time
+                        print(f"Already sent a reminder for event {event_id} recently")
+                        return
+                except Exception as e:
+                    print(f"Error checking last reminder time: {e}")
+                    # Continue with sending the reminder
+
+            # Get the guild and channel
+            guild = self.bot.get_guild(int(event["guild_id"]))
+            if not guild:
+                print(f"Guild {event['guild_id']} not found for event {event_id}")
+                return
+
+            channel = guild.get_channel(int(event["channel_id"]))
+            if not channel:
+                print(f"Channel {event['channel_id']} not found for event {event_id}")
+                return
+
+            # Get the message
+            try:
+                message = await channel.fetch_message(int(event["message_id"]))
+                print(f"Found message for event {event_id}")
+            except Exception as e:
+                print(f"Error fetching message for event {event_id}: {e}")
+                return
+
+            # Create a thread for the event if it doesn't exist
+            thread = None
+            if not event.get("thread_id"):
+                try:
+                    print(f"Creating thread for event {event_id}")
+                    thread = await message.create_thread(
+                        name=f"Discussion: {event['title']}",
+                        auto_archive_duration=1440  # 24 hours
+                    )
+                    # Save the thread ID to the event data
+                    self.events[event_id]["thread_id"] = thread.id
+                    await self.save_events(int(event["guild_id"]))
+                    print(f"Thread created for event {event_id}: {thread.id}")
+                except Exception as e:
+                    print(f"Error creating thread for event {event_id}: {e}")
+                    # Continue without a thread
+                    return
+            else:
+                thread = channel.get_thread(int(event["thread_id"]))
+                if not thread:
+                    print(f"Thread {event['thread_id']} not found for event {event_id}")
+                    # Try to create a new thread
+                    try:
+                        print(f"Creating new thread for event {event_id}")
+                        thread = await message.create_thread(
+                            name=f"Discussion: {event['title']}",
+                            auto_archive_duration=1440  # 24 hours
+                        )
+                        # Update the thread ID in the event data
+                        self.events[event_id]["thread_id"] = thread.id
+                        await self.save_events(int(event["guild_id"]))
+                        print(f"New thread created for event {event_id}: {thread.id}")
+                    except Exception as e:
+                        print(f"Error creating new thread for event {event_id}: {e}")
+                        # Continue without a thread
+                        return
+                else:
+                    print(f"Found existing thread for event {event_id}: {thread.id}")
+
+            # Format the reminder message
+            title = event.get('title', 'Untitled Event')
+            location = event.get('location', 'Not specified')
+
+            # Parse the event time
+            event_time_str = event.get('time', '')
+            try:
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                # Format as Discord timestamp for local time conversion
+                # This will show the time in each user's local timezone
+                discord_timestamp = f"<t:{int(event_time.timestamp())}:F>"
+                start_time = discord_timestamp
+            except ValueError:
+                start_time = event_time_str
+
+            # Build the reminder message
+            reminder_message = "Look alive! We start in 30 minutes!\n\n"
+            reminder_message += f"{title}\n"
+            reminder_message += f"Location: {location}\n"
+            reminder_message += f"Start time: {start_time}\n\n"
+
+            # Add pings section
+            pings = []
+
+            # First add the pingable role if it exists
+            if event.get("event_role_id"):
+                role = guild.get_role(int(event["event_role_id"]))
+                if role:
+                    pings.append(role.mention)
+
+            # Then add individual user pings
+            for role_id, role_data in event["roles"].items():
+                for user_id in role_data.get("users", []):
+                    pings.append(f"<@{user_id}>")
+
+            # Add the pings to the message if there are any
+            if pings:
+                reminder_message += " ".join(pings)
+
+            # Send the reminder in the thread
+            try:
+                await thread.send(reminder_message)
+                print(f"Sent reminder for event {event_id} in thread")
+
+                # Record that we sent a reminder
+                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+                await self.save_events(int(event["guild_id"]))
+            except Exception as e:
+                print(f"Error sending reminder in thread for event {event_id}: {e}")
+        except asyncio.CancelledError:
+            # Task was cancelled, that's fine
+            print(f"Reminder task for event {event_id} was cancelled")
+        except Exception as e:
+            print(f"Unexpected error in send_reminder for event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def cleanup_event(self, event_id, time_diff):
+        """Clean up an event after it's over"""
+        try:
+            # Wait until 2 days after the event
+            cleanup_delay = time_diff.total_seconds()
+            if cleanup_delay > 0:
+                print(f"Scheduling cleanup for event {event_id} in {cleanup_delay} seconds")
+                await asyncio.sleep(cleanup_delay)
+
+            print(f"Starting cleanup for event {event_id}")
+
+            # Check if the event still exists
+            if event_id not in self.events:
+                print(f"Event {event_id} no longer exists, skipping cleanup.")
+                return
+
+            event = self.events[event_id]
+
+            # Remove all Discord roles associated with the event
+            await self.remove_event_roles(event_id)
+
+            # Delete the event message if it exists
+            if "message_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        try:
+                            message = await channel.fetch_message(int(event.get("message_id")))
+                            await message.delete()
+                            print(f"Deleted message for event {event_id}")
+                        except discord.NotFound:
+                            print(f"Message for event {event_id} already deleted")
+                except Exception as e:
+                    print(f"Error deleting message for event {event_id}: {e}")
+
+            # Delete the thread if it exists
+            if "thread_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        thread = channel.get_thread(int(event.get("thread_id")))
+                        if thread:
+                            await thread.delete()
+                            print(f"Deleted thread for event {event_id}")
+                except Exception as e:
+                    print(f"Error deleting thread for event {event_id}: {e}")
+
+            # Handle recurring vs non-recurring events
+            if event.get("recurring"):
+                print(f"Event {event_id} is recurring, scheduling next occurrence")
+                # For recurring events, schedule the next occurrence
+                await self.schedule_next_occurrence(event_id)
+            else:
+                print(f"Event {event_id} is not recurring, removing from storage")
+                # For non-recurring events, just delete
+                del self.events[event_id]
+                await self.save_events(event.get("guild_id"))
+
+            print(f"Cleanup completed for event {event_id}")
+
+        except asyncio.CancelledError:
+            print(f"Cleanup task for event {event_id} was cancelled")
+        except Exception as e:
+            print(f"Error during cleanup of event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def cleanup_old_events(self):
+        """Clean up old events on startup"""
+        try:
+            now = self.get_time_provider().now(pytz.UTC)
+            print(f"Cleaning up old events at {now}")
+            cleanup_count = 0
+            next_occurrence_count = 0
+
+            # Use your events dictionary instead of MongoDB
+            for event_id, event in list(self.events.items()):
+                try:
+                    # Skip events that don't have a time
+                    if not event.get("time"):
+                        continue
+
+                    # Parse the event time
+                    event_time_str = event.get("time")
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+
+                    # Calculate time difference
+                    time_diff = event_time - now
+
+                    # If this is a non-recurring event that's more than 2 days old
+                    if not event.get("recurring") and time_diff.total_seconds() < -2 * 24 * 60 * 60:
+                        print(f"Non-recurring event {event_id} is more than 2 days old, cleaning up")
+
+                        # Delete the event message if it exists
+                        if "message_id" in event and "channel_id" in event:
+                            try:
+                                channel = self.bot.get_channel(int(event.get("channel_id")))
+                                if channel:
+                                    try:
+                                        message = await channel.fetch_message(int(event.get("message_id")))
+                                        await message.delete()
+                                        print(f"Deleted message for event {event_id}")
+                                    except discord.NotFound:
+                                        print(f"Message for event {event_id} already deleted")
+                                    except Exception as e:
+                                        print(f"Error deleting message for event {event_id}: {e}")
+                            except Exception as e:
+                                print(f"Error getting channel for event {event_id}: {e}")
+
+                        # Delete the reminder thread if it exists
+                        if "thread_id" in event and "channel_id" in event:  # Changed from reminder_thread_id to thread_id
+                            try:
+                                channel = self.bot.get_channel(int(event.get("channel_id")))
+                                if channel:
+                                    thread = channel.get_thread(
+                                        int(event.get("thread_id")))  # Changed from reminder_thread_id to thread_id
+                                    if thread:
+                                        await thread.delete()
+                                        print(f"Deleted thread for event {event_id}")
+                            except Exception as e:
+                                print(f"Error deleting thread for event {event_id}: {e}")
+
+                        # Delete the event from storage
+                        del self.events[event_id]
+                        guild_id = event.get("guild_id")
+                        if guild_id:
+                            await self.save_events(guild_id)
+                        cleanup_count += 1
+
+                    # If this is a recurring event that's more than 2 days old
+                    elif event.get("recurring") and time_diff.total_seconds() < -2 * 24 * 60 * 60:
+                        print(f"Recurring event {event_id} is more than 2 days old, scheduling next occurrence")
+
+                        # Delete the old event message if it exists
+                        if "message_id" in event and "channel_id" in event:
+                            try:
+                                channel = self.bot.get_channel(int(event.get("channel_id")))
+                                if channel:
+                                    try:
+                                        message = await channel.fetch_message(int(event.get("message_id")))
+                                        await message.delete()
+                                        print(f"Deleted message for recurring event {event_id}")
+                                    except discord.NotFound:
+                                        print(f"Message for recurring event {event_id} already deleted")
+                                    except Exception as e:
+                                        print(f"Error deleting message for recurring event {event_id}: {e}")
+                            except Exception as e:
+                                print(f"Error getting channel for recurring event {event_id}: {e}")
+
+                        # Schedule the next occurrence
+                        success = await self.schedule_next_occurrence(event_id)
+                        if success:
+                            next_occurrence_count += 1
+
+                except Exception as e:
+                    print(f"Error checking event {event_id} during cleanup: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            print(f"Cleaned up {cleanup_count} old events, scheduled {next_occurrence_count} new occurrences")
+        except Exception as e:
+            print(f"Error in cleanup_old_events: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def save_events(self, guild_id, update_message=False):
+        """Save events to the data directory"""
+        try:
+            guild_id = str(guild_id)
+            # Find all events for this guild
+            guild_events = {}
+            event_count = 0
+
+            for event_id, event in self.events.items():
+                if str(event.get("guild_id")) == guild_id:
+                    guild_events[event_id] = event
+                    event_count += 1
+
+                    # Debug output for message_id
+                    if "message_id" in event:
+                        print(
+                            f"Event {event.get('title', event_id)} has message_id: {event['message_id']} before saving")
+                    else:
+                        print(f"WARNING: Event {event.get('title', event_id)} is missing message_id before saving")
+
+            print(f"Saving {event_count} events for guild {guild_id}")
+
+            # Ensure the events directory exists
+            os.makedirs(os.path.join(self.data_dir, "events"), exist_ok=True)
+
+            # Save the events to a file
+            events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+
+            # Create a backup of the existing file if it exists
+            if os.path.exists(events_file):
+                backup_file = os.path.join(self.data_dir, "events", f"events_{guild_id}_backup.json")
+                try:
+                    shutil.copy2(events_file, backup_file)
+                    print(f"Created backup at: {backup_file}")
+                except Exception as e:
+                    print(f"Error creating backup: {e}")
+
+            # Save the events
+            with open(events_file, "w") as f:
+                json.dump(guild_events, f, indent=4)
+
+            print(f"Successfully saved events for guild {guild_id}")
+
+            # Verify the file was saved correctly
+            if os.path.exists(events_file):
+                file_size = os.path.getsize(events_file)
+                print(f"Verified file exists with size: {file_size} bytes")
+
+                # Verify message_ids were saved correctly
+                for event_id, event in guild_events.items():
+                    if "message_id" in event:
+                        print(
+                            f"Verified saved event {event.get('title', event_id)} has message_id: {event['message_id']}")
+                    else:
+                        print(f"WARNING: Event {event.get('title', event_id)} is missing message_id after saving")
+
+            # Update event messages if requested (but this should rarely be used)
+            if update_message:
+                for event_id, event in guild_events.items():
+                    await self.update_event_message(event_id)
+
+            return True
+        except Exception as e:
+            print(f"Error saving events: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def repair_events_file(self, guild_id):
+        """Repair the events file if it's corrupted or empty"""
+        events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+
+        # Check if file exists but is empty or corrupted
+        if os.path.exists(events_file):
+            try:
+                with open(events_file, "r") as f:
+                    content = f.read().strip()
+                    if not content or content == "{}":
+                        # File is empty or just contains {}, create a new one
+                        with open(events_file, "w") as f:
+                            json.dump({}, f)
+                        print(f"Repaired empty events file for guild {guild_id}")
+                    else:
+                        # Try to parse the JSON
+                        try:
+                            json.loads(content)
+                        except json.JSONDecodeError:
+                            # File is corrupted, create a new one
+                            with open(events_file, "w") as f:
+                                json.dump({}, f)
+                            print(f"Repaired corrupted events file for guild {guild_id}")
+            except Exception as e:
+                print(f"Error checking events file for guild {guild_id}: {e}")
+                # Create a new file
+                with open(events_file, "w") as f:
+                    json.dump({}, f)
+                print(f"Created new events file for guild {guild_id}")
+        else:
+            # Create the directory if it doesn't exist
+            os.makedirs(os.path.dirname(events_file), exist_ok=True)
+            # Create a new file
+            with open(events_file, "w") as f:
+                json.dump({}, f)
+            print(f"Created new events file for guild {guild_id}")
+
+    async def delete_event(self, event_id):
+        """Delete an event"""
+        try:
+            # Check if the event exists
+            if event_id not in self.events:
+                print(f"Event {event_id} not found")
+                return False
+
+            event = self.events[event_id]
+            guild_id = event.get("guild_id")
+
+            # Remove all Discord roles associated with the event
+            await self.remove_event_roles(event_id)
+
+            # Delete the message if it exists
+            if event.get("message_id") and event.get("channel_id"):
+                try:
+                    guild = self.bot.get_guild(int(guild_id))
+                    if guild:
+                        channel = guild.get_channel(int(event.get("channel_id")))
+                        if channel:
+                            try:
+                                message = await channel.fetch_message(int(event.get("message_id")))
+                                await message.delete()
+                                print(f"Deleted message for event {event_id}")
+                            except discord.NotFound:
+                                print(f"Message for event {event_id} already deleted")
+                            except Exception as e:
+                                print(f"Error deleting message: {e}")
+                except Exception as e:
+                    print(f"Error deleting message: {e}")
+
+            # Delete the thread if it exists
+            if event.get("thread_id") and event.get("channel_id"):
+                try:
+                    guild = self.bot.get_guild(int(guild_id))
+                    if guild:
+                        channel = guild.get_channel(int(event.get("channel_id")))
+                        if channel:
+                            thread = channel.get_thread(int(event.get("thread_id")))
+                            if thread:
+                                await thread.delete()
+                                print(f"Deleted thread for event {event_id}")
+                except Exception as e:
+                    print(f"Error deleting thread: {e}")
+
+            # Cancel any tasks for this event
+            if event_id in self.reminder_tasks:
+                self.reminder_tasks[event_id].cancel()
+                del self.reminder_tasks[event_id]
+
+            if event_id in self.cleanup_tasks:
+                self.cleanup_tasks[event_id].cancel()
+                del self.cleanup_tasks[event_id]
+
+            if event_id in self.recurring_tasks:
+                self.recurring_tasks[event_id].cancel()
+                del self.recurring_tasks[event_id]
+
+            # Remove the event from the dictionary
+            del self.events[event_id]
+
+            # Save the events
+            await self.save_events(guild_id)
+
+            print(f"Successfully deleted event {event_id}")
+            return True
+        except Exception as e:
+            print(f"Error deleting event: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def load_events(self, guild_id=None):
+        """Load events from the data directory"""
+        try:
+            if guild_id is None:
+                print("Loading all events in attendance cog...")
+                self.events = {}
+                total_events = 0
+                # Ensure the events directory exists
+                os.makedirs(os.path.join(self.data_dir, "events"), exist_ok=True)
+                # Get all event files
+                event_files = glob.glob(os.path.join(self.data_dir, "events", "events_*.json"))
+                for event_file in event_files:
+                    try:
+                        # Extract guild ID from filename
+                        match = re.search(r"events_(\d+)\.json", os.path.basename(event_file))
+                        if match:
+                            file_guild_id = match.group(1)
+                            # Repair this file if needed
+                            await self.repair_events_file(file_guild_id)
+
+                            # Load events for this guild
+                            with open(event_file, "r") as f:
+                                file_content = f.read().strip()
+                                if not file_content or file_content == "{}":
+                                    print(f"File {event_file} contains empty JSON object")
+                                    continue
+                                guild_events = json.loads(file_content)
+                            # Check if guild_events is empty
+                            if not guild_events:
+                                print(f"No events found in {event_file}")
+                                continue
+                            # Add events to the main events dictionary
+                            for event_id, event_data in guild_events.items():
+                                self.events[event_id] = event_data
+                                total_events += 1
+                            print(f"Loaded {len(guild_events)} events for guild {file_guild_id}")
+                    except Exception as e:
+                        print(f"Error loading events from {event_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                print(f"Loaded a total of {total_events} events")
+                print("Events loaded successfully")
+                return True
+            else:
+                # Load events for a specific guild
+                guild_id = str(guild_id)
+
+                # Repair the events file if needed
+                await self.repair_events_file(guild_id)
+
+                events_file = os.path.join(self.data_dir, "events", f"events_{guild_id}.json")
+                if os.path.exists(events_file):
+                    try:
+                        with open(events_file, "r") as f:
+                            file_content = f.read().strip()
+                            if not file_content or file_content == "{}":
+                                print(f"File {events_file} contains empty JSON object")
+                                return True
+                            guild_events = json.loads(file_content)
+                        # Check if guild_events is empty
+                        if not guild_events:
+                            print(f"No events found in {events_file}")
+                            return True
+                        # Add events to the main events dictionary
+                        for event_id, event_data in guild_events.items():
+                            self.events[event_id] = event_data
+                        print(f"Loaded {len(guild_events)} events for guild {guild_id}")
+                        return True
+                    except Exception as e:
+                        print(f"Error loading events for guild {guild_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                else:
+                    print(f"No events file found for guild {guild_id}")
+                    return True  # Return True since this isn't an error
+        except Exception as e:
+            print(f"Error loading events: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
