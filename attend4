@@ -1,0 +1,521 @@
+class Attendance(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.events = {}
+        self.reminder_tasks = {}
+        self.cleanup_tasks = {}
+        self.pending_tasks = {}
+        self.recurring_tasks = {}
+        self.data_dir = "data"
+
+        # Set up all data storage
+        self.setup_data_storage()
+
+        # We'll load events when the bot is ready
+        self.bot.loop.create_task(self.load_all_events_when_ready())
+
+        # Start the check_events task
+        self.check_events.start()
+
+    def cog_load(self):
+        """Called when the cog is loaded"""
+        # Only start the task if it's not already running
+        if not self.check_events.is_running():
+            self.check_events.start()
+
+        # Clean up old events
+        asyncio.create_task(self.cleanup_old_events())
+
+    def cog_unload(self):
+        """Called when the cog is unloaded"""
+        # Stop the task if it's running
+        if self.check_events.is_running():
+            self.check_events.cancel()
+
+    def get_time_provider(self):
+        """Get the time provider from the TimeAcceleration cog, or use the default"""
+        time_accel_cog = self.bot.get_cog("TimeAcceleration")
+        if time_accel_cog and hasattr(time_accel_cog, 'time_provider'):
+            return time_accel_cog.time_provider
+
+        # Return a default time provider that just uses the real time
+        class DefaultTimeProvider:
+            def now(self, tz=None):
+                return datetime.now(tz)
+
+        return DefaultTimeProvider()
+
+    async def setup_recurring_events(self):
+        """Set up recurring events after bot restart"""
+        print("Setting up recurring events...")
+        # Load all events
+        await self.load_events()
+        # Get all recurring events
+        recurring_events = {event_id: event for event_id, event in self.events.items()
+                            if event.get("recurring")}
+        print(f"Found {len(recurring_events)} recurring events")
+        # Schedule next occurrences for each recurring event
+        for event_id, event in recurring_events.items():
+            # Only schedule if the event hasn't happened yet
+            event_time_str = event.get("time")
+            if event_time_str:
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+                    now = self.get_time_provider().now(pytz.UTC)
+
+                    # Calculate time difference
+                    time_diff = event_time - now
+                    # Check if this event already has a message
+                    if event.get("message_id"):
+                        print(f"Event {event_id} already has a message posted")
+                        # Store the last reminder time to prevent duplicate reminders on restart
+                        last_reminder_key = f"last_reminder_{event_id}"
+                        last_reminder_time = self.events.get(event_id, {}).get(last_reminder_key)
+                        # If the event is in the future, schedule its next occurrence
+                        if time_diff.total_seconds() > 0:
+                            print(f"Scheduling next occurrence for future event {event_id}")
+                            self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                                self.schedule_next_occurrence(event_id)
+                            )
+                        # If the event is in the past but less than 2 days ago, wait until 2 days have passed
+                        elif time_diff.total_seconds() > -2 * 24 * 60 * 60:
+                            print(f"Event {event_id} happened less than 2 days ago, waiting until 2 days have passed")
+                            # Check if we've already sent a reminder since the event
+                            if last_reminder_time:
+                                last_reminder = datetime.strptime(last_reminder_time, "%Y-%m-%d %H:%M")
+                                last_reminder = last_reminder.replace(tzinfo=pytz.UTC)
+                                # If we've already sent a reminder after the event, don't send another one
+                                if last_reminder > event_time:
+                                    print(f"Already sent a reminder for event {event_id} after it occurred")
+                                    continue
+
+                            wait_time = (2 * 24 * 60 * 60) + time_diff.total_seconds()
+
+                            # Create a task that waits and then schedules the next occurrence
+                            async def wait_and_schedule(event_id, wait_time):
+                                await asyncio.sleep(wait_time)
+                                # Record that we sent a reminder
+                                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime(
+                                    "%Y-%m-%d %H:%M")
+                                await self.save_events(
+                                    self.events[event_id].get("guild_id"))  # Save to persist this information
+                                await self.schedule_next_occurrence(event_id)
+
+                            # Create and store the task
+                            task = asyncio.create_task(wait_and_schedule(event_id, wait_time))
+                            self.pending_tasks[event_id] = task
+                except Exception as e:
+                    print(f"Error scheduling next occurrence for event {event_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    def calculate_next_occurrence(self, recurrence_rule, last_occurrence):
+        """Calculate the next occurrence based on the recurrence rule."""
+        try:
+            # Parse the recurrence rule
+            rrule_obj = rrulestr(recurrence_rule, dtstart=last_occurrence)
+
+            # Get the next occurrence after now
+            now = self.get_time_provider().now(pytz.UTC)
+
+            next_occurrence = rrule_obj.after(now, inc=False)
+
+            return next_occurrence
+        except Exception as e:
+            print(f"Error calculating next occurrence: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+
+    async def safe_respond(self, interaction, message, ephemeral=True):
+        """Safely respond to an interaction, handling cases where the interaction might have timed out"""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(message, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(message, ephemeral=ephemeral)
+        except discord.errors.NotFound:
+            # Interaction has expired or webhook is invalid
+            print(f"Could not respond to interaction - it may have expired")
+        except discord.errors.HTTPException as e:
+            print(f"HTTP Exception when responding to interaction: {e}")
+        except Exception as e:
+            print(f"Error responding to interaction: {e}")
+
+    async def get_event(self, guild_id, event_id):
+        """Safely get an event after ensuring events are loaded"""
+        await self.load_events(guild_id)
+        return self.events.get(event_id)
+
+    def setup_data_storage(self):
+        """Set up all necessary data directories and storage"""
+        try:
+            # Create the main data directory
+            os.makedirs(self.data_dir, exist_ok=True)
+
+            # Create the attendance data directory
+            attendance_dir = os.path.join(self.data_dir, "attendance")
+            os.makedirs(attendance_dir, exist_ok=True)
+
+            # Create the events directory
+            events_dir = os.path.join(self.data_dir, "events")
+            os.makedirs(events_dir, exist_ok=True)
+
+            # Initialize the attendance tracker
+            self.attendance_tracker = AttendanceTracker()
+
+            print("Data storage system initialized successfully")
+        except Exception as e:
+            print(f"Error setting up data storage: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def can_join_restricted_role(self, user, role_data):
+        """Check if a user can join a restricted role"""
+        # If the role isn't restricted, anyone can join
+        if not role_data.get("restricted", False):
+            return True
+
+        # Check if the role has a required role
+        required_role_id = role_data.get("required_role_id")
+        if not required_role_id:
+            return False
+
+        # Check if the user has the required role
+        for role in user.roles:
+            if str(role.id) == str(required_role_id):
+                return True
+
+        return False
+
+    def get_toggle_lock_key(self, user_id, event_id):
+        return f"{user_id}:{event_id}"
+
+    # Helper function for consistent datetime handling
+    async def parse_event_time(self, time_str):
+        try:
+            # Parse the input time string
+            naive_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+            # Convert EST to UTC for storage
+            est = timezone('US/Eastern')
+            est_time = est.localize(naive_time)
+            utc_time = est_time.astimezone(pytz.UTC)
+            # Return both the datetime object and formatted string
+            return utc_time, utc_time.strftime("%Y-%m-%d %H:%M")
+        except ValueError as e:
+            raise ValueError(f"Invalid time format: {e}")
+
+    async def on_interaction(self, interaction):
+        """Handle button interactions for attendance"""
+        if not interaction.data or not interaction.data.get("custom_id"):
+            return
+
+        custom_id = interaction.data["custom_id"]
+        if custom_id.startswith("attendance:"):
+            # Parse the custom ID to get event_id and role_id
+            parts = custom_id.split(":")
+            if len(parts) >= 4 and parts[3] == "toggle":
+                event_id = parts[1]
+                role_id = parts[2]
+
+                # Handle the role toggle directly
+                await self.toggle_role(interaction, event_id, role_id)
+
+    async def cancel_task_safely(self, task_dict, event_id):
+        """Safely cancel a task if it exists"""
+        if event_id in task_dict:
+            task = task_dict[event_id]
+            if not task.done() and not task.cancelled():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del task_dict[event_id]
+
+    def parse_time_input(self, time_str):
+        """Parse a time string input and convert to UTC"""
+        # Parse the input time string
+        naive_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        # Convert EST to UTC for storage
+        est = timezone('US/Eastern')
+        est_time = est.localize(naive_time)
+        utc_time = est_time.astimezone(pytz.UTC)
+        return utc_time
+
+    def format_time_for_display(self, utc_time_str):
+        """Format a UTC time string for display using Discord's timestamp feature"""
+        try:
+            # Parse the UTC time
+            utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+
+            # Get Unix timestamp for Discord's timestamp feature
+            unix_timestamp = int(utc_time.timestamp())
+
+            # Format with Discord timestamp (shows in user's local time)
+            discord_timestamp = f"<t:{unix_timestamp}:F>"  # F = Full date and time
+
+            # Also add relative time
+            relative_time = f"<t:{unix_timestamp}:R>"  # R = Relative time
+
+            return f"{discord_timestamp}\n({relative_time})"
+        except Exception as e:
+            print(f"Error formatting time: {e}")
+            # Fallback to EST formatting
+            utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+            est = timezone('US/Eastern')
+            est_time = utc_time.astimezone(est)
+            return est_time.strftime("%Y-%m-%d %I:%M %p EST")
+
+    async def load_all_events_when_ready(self):
+        """Wait until the bot is ready, then load events for all guilds"""
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            try:
+                await self.load_events(guild.id)
+            except Exception as e:
+                print(f"Error loading events for guild {guild.id}: {e}")
+
+        # Check for missing message IDs
+        missing_count, total_count = await self.check_event_message_ids()
+
+        # Fix missing message IDs if needed
+        if missing_count > 0:
+            await self.fix_missing_message_ids()
+
+        # Fix recurring events with missing message IDs
+        await self.fix_recurring_events()
+
+        # Start any necessary tasks for loaded events
+        if hasattr(self, 'start_tasks_for_loaded_events'):
+            await self.start_tasks_for_loaded_events()
+
+    async def check_event_message_ids(self):
+        """Check all events for missing message IDs"""
+        print("Checking all events for missing message IDs...")
+        missing_count = 0
+        total_count = 0
+
+        for event_id, event in self.events.items():
+            total_count += 1
+            if 'message_id' not in event or not event['message_id']:
+                missing_count += 1
+                print(f"Event {event_id} is missing message_id")
+                # Print other event details to help debug
+                print(f"  Title: {event.get('title')}")
+                print(f"  Guild ID: {event.get('guild_id')}")
+                print(f"  Channel ID: {event.get('channel_id')}")
+
+        print(f"Found {missing_count} events with missing message IDs out of {total_count} total events")
+        return missing_count, total_count
+
+    async def fix_recurring_events(self):
+        """Fix recurring events that are missing message IDs"""
+        print("Checking for recurring events with missing message IDs...")
+        fixed_count = 0
+
+        for event_id, event in list(self.events.items()):
+            # Check if this is a recurring event with missing message_id
+            if event.get("recurring", False) and ('message_id' not in event or not event['message_id']):
+                print(f"Found recurring event {event_id} with missing message_id")
+
+                # Check if we have the channel info
+                if 'channel_id' in event and event['channel_id']:
+                    try:
+                        # Get the channel
+                        channel = self.bot.get_channel(int(event['channel_id']))
+                        if not channel:
+                            print(f"Channel {event['channel_id']} not found for event {event_id}")
+                            continue
+
+                        # Create a new embed and view
+                        embed = await self.create_event_embed(event_id)
+                        view = AttendanceView(self, event_id)
+
+                        # Send a new message
+                        message = await channel.send(embed=embed, view=view)
+
+                        # Update the event with the new message ID
+                        event['message_id'] = str(message.id)
+                        print(f"Fixed recurring event {event_id} with new message_id: {event['message_id']}")
+
+                        # Save the events
+                        await self.save_events(event['guild_id'])
+                        fixed_count += 1
+                    except Exception as e:
+                        print(f"Error fixing recurring event {event_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+        print(f"Fixed {fixed_count} recurring events with missing message IDs")
+        return fixed_count
+
+    async def fix_missing_message_ids(self):
+        """Fix any events with missing message IDs"""
+        print("Checking for events with missing message IDs...")
+        fixed_count = 0
+
+        for event_id, event in list(self.events.items()):  # Use list() to create a copy we can modify
+            if 'message_id' not in event or not event['message_id']:
+                print(f"Found event {event_id} with missing message_id")
+
+                # Check if we can recover the event
+                if 'channel_id' in event and event['channel_id']:
+                    try:
+                        # Get the channel
+                        channel = self.bot.get_channel(int(event['channel_id']))
+                        if not channel:
+                            print(f"Channel {event['channel_id']} not found for event {event_id}")
+                            continue
+
+                        # Create a new embed and view
+                        embed = await self.create_event_embed(event_id)
+                        view = AttendanceView(self, event_id)
+
+                        # Send a new message
+                        await channel.send(content="<@&Staff>", embed=embed, view=view)
+
+                        # Update the event with the new message ID
+                        event['message_id'] = str(message.id)
+                        print(f"Fixed event {event_id} with new message_id: {event['message_id']}")
+
+                        # Save the events
+                        await self.save_events(event['guild_id'])
+                        fixed_count += 1
+
+                    except Exception as e:
+                        print(f"Error fixing event {event_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"Cannot fix event {event_id} - missing channel_id")
+
+        print(f"Fixed {fixed_count} events with missing message IDs")
+        return fixed_count
+
+    async def start_tasks_for_loaded_events(self):
+        """Start tasks for all loaded events"""
+        now = self.get_time_provider().now(pytz.UTC)
+
+        for event_id, event in self.events.items():
+            try:
+                # Parse the event time
+                event_time_str = event["time"]
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+
+                # Schedule reminder if the event is in the future
+                time_diff = event_time - now
+                if time_diff.total_seconds() > 0:
+                    self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                        self.send_reminder(event_id, time_diff)
+                    )
+
+                # Schedule cleanup for all events
+                cleanup_time = event_time + timedelta(days=1)
+                cleanup_diff = cleanup_time - now
+                if cleanup_diff.total_seconds() > 0:
+                    self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                        self.cleanup_event(event_id, cleanup_diff)
+                    )
+
+                # Schedule recurring tasks for recurring events
+                if event.get("recurring", False) and event_time > now:
+                    self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                        self.schedule_next_occurrence(event_id)
+                    )
+            except Exception as e:
+                print(f"Error starting tasks for event {event_id}: {e}")
+
+    async def assign_event_role(self, event_id, user_id):
+        """Safely assign an event role to a user"""
+        event = self.events.get(event_id)
+        if not event or not event.get("event_role_id"):
+            return False
+
+        guild = self.bot.get_guild(event["guild_id"])
+        if not guild:
+            return False
+
+        member = guild.get_member(int(user_id))
+        if not member:
+            return False
+
+        role = guild.get_role(event["event_role_id"])
+        if not role:
+            return False
+
+        try:
+            await member.add_roles(role, reason=f"Signed up for event: {event['title']}")
+            if str(user_id) not in event["event_role_users"]:
+                event["event_role_users"].append(str(user_id))
+            return True
+        except Exception as e:
+            print(f"Error assigning role: {e}")
+            return False
+
+    def cog_unload(self):
+        # Cancel all tasks when the cog is unloaded
+        self.check_events.cancel()
+        for task in self.reminder_tasks.values():
+            task.cancel()
+        for task in self.cleanup_tasks.values():
+            task.cancel()
+        for task in self.recurring_tasks.values():
+            task.cancel()
+
+    @tasks.loop(minutes=30)
+    async def check_events(self):
+        """Periodically check all events to ensure they're being handled"""
+        try:
+            now = self.get_time_provider().now(pytz.UTC)
+            print(f"Checking events at {now}")
+
+            for event_id, event in list(self.events.items()):
+                try:
+                    # Skip events that don't have a time
+                    if not event.get("time"):
+                        continue
+
+                    # Parse the event time
+                    event_time_str = event.get("time")
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+
+                    # Calculate time difference
+                    time_diff = event_time - now
+
+                    # If this is a recurring event
+                    if event.get("recurring"):
+                        # If the event is more than 2 days in the past and doesn't have a task
+                        if time_diff.total_seconds() < -2 * 24 * 60 * 60 and event_id not in self.recurring_tasks:
+                            print(f"Event {event_id} is more than 2 days in the past, scheduling next occurrence")
+                            self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                                self.schedule_next_occurrence(event_id)
+                            )
+                        # If the event is in the future but doesn't have role removal scheduled
+                        elif time_diff.total_seconds() > 0 and f"role_{event_id}" not in self.pending_tasks:
+                            # Schedule role removal for 4 hours after the event
+                            role_removal_time = event_time + timedelta(hours=4)
+                            role_diff = (role_removal_time - now).total_seconds()
+
+                            if role_diff > 0:
+                                print(f"Scheduling role removal for event {event_id}")
+                                self.pending_tasks[f"role_{event_id}"] = self.bot.loop.create_task(
+                                    self.remove_role_after_delay(event_id, role_diff)
+                                )
+
+                except Exception as e:
+                    print(f"Error checking event {event_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        except Exception as e:
+            print(f"Error in check_events: {e}")
+            import traceback
+            traceback.print_exc()
+
+    @check_events.before_loop
+    async def before_check_events(self):
+        await self.bot.wait_until_ready()
