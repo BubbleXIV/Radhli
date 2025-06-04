@@ -1,0 +1,683 @@
+    @app_commands.command(name="list", description="List all events")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def list_events(self, interaction: discord.Interaction):
+        """List all events"""
+        try:
+            # Load events first
+            await self.load_events(interaction.guild.id)
+
+            # Filter events for this guild - fix the type comparison
+            guild_events = {
+                event_id: event for event_id, event in self.events.items()
+                if event.get("guild_id") == interaction.guild.id and not event.get("cleaned_up", False)
+            }
+
+            print(f"Found {len(guild_events)} events for guild {interaction.guild.id}")
+
+            if not guild_events:
+                embed = discord.Embed(
+                    title="📅 Upcoming Events",
+                    description="No active events found.",
+                    color=0x87CEEB
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            # Create the main embed
+            embed = discord.Embed(
+                title="📅 Upcoming Events",
+                description="Here are all the upcoming events:",
+                color=0x87CEEB,
+                timestamp=datetime.utcnow()
+            )
+
+            # Sort events by time
+            sorted_events = sorted(
+                guild_events.items(),
+                key=lambda x: x[1].get("time", "9999-12-31 23:59")
+            )
+
+            # Add events to embed
+            for event_id, event in sorted_events:
+                try:
+                    title = event.get("title", "Untitled Event")
+                    description = event.get("description", "No description provided")
+                    location = event.get("location", "Not specified")
+
+                    # Format the time
+                    event_time_str = event.get("time")
+                    if event_time_str:
+                        try:
+                            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                            local_time = event_time.astimezone(timezone('US/Eastern'))
+
+                            # Calculate time difference
+                            now = datetime.now(timezone('US/Eastern'))
+                            time_diff = event_time.astimezone(timezone('US/Eastern')) - now
+
+                            if time_diff.days > 0:
+                                time_ago = f"in {time_diff.days} days"
+                            elif time_diff.days < 0:
+                                time_ago = f"{abs(time_diff.days)} days ago"
+                            elif time_diff.total_seconds() > 0:
+                                hours = int(time_diff.total_seconds() // 3600)
+                                if hours > 0:
+                                    time_ago = f"in {hours} hours"
+                                else:
+                                    minutes = int(time_diff.total_seconds() // 60)
+                                    time_ago = f"in {minutes} minutes"
+                            else:
+                                hours_ago = int(abs(time_diff.total_seconds()) // 3600)
+                                time_ago = f"{hours_ago} hours ago"
+
+                            formatted_time = local_time.strftime("%A, %B %d, %Y %I:%M %p")
+                            time_display = f"{formatted_time} ({time_ago})"
+                        except Exception as e:
+                            print(f"Error parsing time for event {event_id}: {e}")
+                            time_display = event_time_str
+                    else:
+                        time_display = "Not specified"
+
+                    # Count signups
+                    signup_count = 0
+                    if "signups" in event:
+                        for role_signups in event["signups"].values():
+                            signup_count += len(role_signups)
+
+                    # Check if recurring and calculate next occurrence
+                    recurring_info = ""
+                    next_occurrence = ""
+                    if event.get("recurring"):
+                        recurring_type = event.get("recurring_type", "weekly")
+                        recurring_info = f"Recurring: {recurring_type.title()}"
+
+                        # Calculate next occurrence for recurring events
+                        if event_time_str:
+                            try:
+                                base_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                                now = datetime.now(pytz.UTC)
+
+                                if recurring_type.lower() == "weekly":
+                                    # Find next weekly occurrence
+                                    days_ahead = 7
+                                    next_time = base_time
+                                    while next_time <= now:
+                                        next_time += timedelta(days=7)
+                                elif recurring_type.lower() == "daily":
+                                    days_ahead = 1
+                                    next_time = base_time
+                                    while next_time <= now:
+                                        next_time += timedelta(days=1)
+                                else:
+                                    next_time = base_time
+
+                                if next_time != base_time:
+                                    next_local = next_time.astimezone(timezone('US/Eastern'))
+                                    next_formatted = next_local.strftime("%A, %B %d, %Y %I:%M %p")
+
+                                    # Calculate time until next occurrence
+                                    time_until = next_time - now
+                                    if time_until.days > 0:
+                                        time_until_str = f"in {time_until.days} days"
+                                    else:
+                                        hours_until = int(time_until.total_seconds() // 3600)
+                                        time_until_str = f"in {hours_until} hours"
+
+                                    next_occurrence = f"Next Occurrence: {next_formatted} ({time_until_str})"
+                            except Exception as e:
+                                print(f"Error calculating next occurrence: {e}")
+
+                    # Check if message exists
+                    message_status = ""
+                    if not event.get("message_id"):
+                        message_status = " ⚠️"
+
+                    # Build the field value
+                    field_value = f"**Description:** {description}\n"
+                    field_value += f"**Time:** {time_display}\n"
+                    field_value += f"**Location:** {location}\n"
+                    field_value += f"**Signups:** {signup_count}\n"
+
+                    if recurring_info:
+                        field_value += f"**{recurring_info}**\n"
+                    if next_occurrence:
+                        field_value += f"**{next_occurrence}**\n"
+
+                    field_value += f"**ID:** `{event_id}`"
+
+                    # Add field for this event
+                    embed.add_field(
+                        name=f"{title}{message_status}",
+                        value=field_value,
+                        inline=False
+                    )
+
+                except Exception as e:
+                    print(f"Error processing event {event_id}: {e}")
+                    embed.add_field(
+                        name=f"{event.get('title', 'Error Event')} ❌",
+                        value=f"Error processing event data\n**ID:** `{event_id}`",
+                        inline=False
+                    )
+
+            # Add footer with helpful info
+            embed.set_footer(
+                text=f"Total Events: {len(guild_events)} | ⚠️ = Missing message",
+                icon_url=interaction.guild.icon.url if interaction.guild.icon else None
+            )
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            print(f"Error in list_events: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                error_embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"An error occurred while loading events:\n```{str(e)}```",
+                    color=0xFF0000
+                )
+                await interaction.response.send_message(embed=error_embed, ephemeral=True)
+            except:
+                print("Could not send error response")
+
+    @app_commands.command(name="delete", description="Delete an attendance event")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_event_command(self, interaction: discord.Interaction, event_id: str):
+        """Delete an attendance event"""
+        await self.load_events(interaction.guild.id)
+
+        event = self.events.get(event_id)
+        if not event:
+            return await interaction.response.send_message("Event not found.", ephemeral=True)
+
+        if event["guild_id"] != interaction.guild.id:
+            return await interaction.response.send_message("Event not found in this guild.", ephemeral=True)
+
+        # Try to delete the message
+        try:
+            channel = interaction.guild.get_channel(event["channel_id"])
+            if channel:
+                message = await channel.fetch_message(event["message_id"])
+                await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        # Delete the event
+        await self.delete_event(event_id)
+
+        await interaction.response.send_message(f"Event '{event['title']}' has been deleted.", ephemeral=True)
+
+    @app_commands.command(name="delete_all", description="Delete all attendance events in this guild")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_all_events_command(self, interaction: discord.Interaction):
+        """Delete all attendance events in this guild"""
+        # Defer the response as this might take some time
+        await interaction.response.defer(ephemeral=True)
+
+        # Load events for this guild
+        await self.load_events(interaction.guild.id)
+
+        # Filter events that belong to this guild
+        guild_events = {event_id: event for event_id, event in self.events.items()
+                        if event.get("guild_id") == interaction.guild.id}
+
+        if not guild_events:
+            return await interaction.followup.send("No events found in this guild.", ephemeral=True)
+
+        deleted_count = 0
+        for event_id, event in guild_events.items():
+            # Try to delete the message
+            try:
+                channel = interaction.guild.get_channel(event.get("channel_id"))
+                if channel and event.get("message_id"):
+                    try:
+                        message = await channel.fetch_message(event["message_id"])
+                        await message.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                        print(f"Could not delete message for event {event_id}: {e}")
+            except Exception as e:
+                print(f"Error processing channel/message for event {event_id}: {e}")
+
+            # Cancel any scheduled tasks
+            if event_id in self.reminder_tasks:
+                self.reminder_tasks[event_id].cancel()
+                del self.reminder_tasks[event_id]
+
+            if event_id in self.cleanup_tasks:
+                self.cleanup_tasks[event_id].cancel()
+                del self.cleanup_tasks[event_id]
+
+            if event_id in self.recurring_tasks:
+                self.recurring_tasks[event_id].cancel()
+                del self.recurring_tasks[event_id]
+
+            # Delete the event from our dictionary
+            if event_id in self.events:
+                del self.events[event_id]
+                deleted_count += 1
+
+        # Save the updated events
+        await self.save_events(interaction.guild.id)
+
+        await interaction.followup.send(f"Deleted {deleted_count} events from this guild.", ephemeral=True)
+
+    @app_commands.command(name="attendance", description="View or export attendance data")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.choices(
+        view_type=[
+            app_commands.Choice(name="User Attendance", value="user"),
+            app_commands.Choice(name="Role Attendance", value="role"),
+            app_commands.Choice(name="Date Attendance", value="date"),
+            app_commands.Choice(name="All Attendance", value="all")
+        ],
+        output_format=[
+            app_commands.Choice(name="Discord Message", value="discord"),
+            app_commands.Choice(name="CSV File", value="csv")
+        ]
+    )
+    async def view_attendance(self, interaction: discord.Interaction, view_type: str, output_format: str,
+                              user: discord.Member = None, role_name: str = None, date: str = None):
+        """
+        View or export attendance data
+
+        Parameters:
+        -----------
+        view_type: str
+            Type of view: 'user', 'role', 'date', or 'all'
+        output_format: str
+            Format to display results: 'discord' or 'csv'
+        user: discord.Member
+            User to view attendance for (required for 'user' view type)
+        role_name: str
+            Role name to view attendance for (required for 'role' view type)
+        date: str
+            Date to view attendance for in YYYY-MM-DD format (required for 'date' view type)
+        """
+        await self.load_events(interaction.guild.id)
+
+        # Filter events for this guild
+        guild_events = {
+            event_id: event for event_id, event in self.events.items()
+            if event["guild_id"] == interaction.guild.id  # Both should be integers
+        }
+
+        if not guild_events:
+            return await interaction.response.send_message("No events found for this guild.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Validate parameters based on view type
+        if view_type == "user" and not user:
+            return await interaction.followup.send("Please provide a user to view attendance for.", ephemeral=True)
+
+        if view_type == "role" and not role_name:
+            return await interaction.followup.send("Please provide a role name to view attendance for.", ephemeral=True)
+
+        if view_type == "date" and not date:
+            return await interaction.followup.send("Please provide a date to view attendance for (YYYY-MM-DD).",
+                                                   ephemeral=True)
+
+        # Validate date format if provided
+        if date:
+            try:
+                filter_date = datetime.strptime(date, "%Y-%m-%d").date()
+            except ValueError:
+                return await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD.", ephemeral=True)
+
+        # Process the data based on view type
+        if view_type == "user":
+            # Get user attendance data
+            user_data = []
+            for event_id, event in guild_events.items():
+                event_time_str = event.get("time", "Unknown")
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_date = event_time.strftime("%Y-%m-%d")
+                except ValueError:
+                    event_date = "Unknown"
+
+                # Check if user was in any role
+                user_found = False
+                for role_id, role_data in event.get("roles", {}).items():
+                    if str(user.id) in role_data.get("users", []):
+                        user_data.append({
+                            "event_title": event.get("title", "Unknown Event"),
+                            "event_date": event_date,
+                            "role": role_data.get("name", "Unknown Role"),
+                            "attended": "Yes"
+                        })
+                        user_found = True
+                        break
+
+                if not user_found:
+                    user_data.append({
+                        "event_title": event.get("title", "Unknown Event"),
+                        "event_date": event_date,
+                        "role": "N/A",
+                        "attended": "No"
+                    })
+
+            # Output the data
+            if output_format == "discord":
+                if not user_data:
+                    await interaction.followup.send(f"No attendance data found for {user.display_name}.",
+                                                    ephemeral=True)
+                    return
+
+                # Create an embed to display the data
+                embed = discord.Embed(
+                    title=f"Attendance for {user.display_name}",
+                    color=discord.Color.blue()
+                )
+
+                # Add fields for each event (up to 25 fields max)
+                for i, entry in enumerate(user_data[:25]):
+                    embed.add_field(
+                        name=f"{entry['event_title']} ({entry['event_date']})",
+                        value=f"Role: {entry['role']}\nAttended: {entry['attended']}",
+                        inline=True
+                    )
+
+                if len(user_data) > 25:
+                    embed.set_footer(text=f"Showing 25 of {len(user_data)} events. Use CSV export to see all.")
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:  # CSV
+                csv_data = io.StringIO()
+                writer = csv.writer(csv_data)
+                writer.writerow(["Event Title", "Event Date", "Role", "Attended"])
+
+                for entry in user_data:
+                    writer.writerow([
+                        entry["event_title"],
+                        entry["event_date"],
+                        entry["role"],
+                        entry["attended"]
+                    ])
+
+                csv_data.seek(0)
+                file = discord.File(
+                    fp=io.BytesIO(csv_data.getvalue().encode()),
+                    filename=f"user_{user.id}_attendance.csv"
+                )
+                await interaction.followup.send(
+                    f"Here's the attendance data for {user.display_name}:",
+                    file=file,
+                    ephemeral=True
+                )
+
+        elif view_type == "role":
+            # Get role attendance data
+            role_data = []
+            for event_id, event in guild_events.items():
+                event_time_str = event.get("time", "Unknown")
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_date = event_time.strftime("%Y-%m-%d")
+                except ValueError:
+                    event_date = "Unknown"
+
+                # Find the role that matches the filter
+                for role_id, role_data_item in event.get("roles", {}).items():
+                    if role_data_item.get("name", "").lower() == role_name.lower():
+                        # Add each user in this role
+                        for user_id in role_data_item.get("users", []):
+                            member = interaction.guild.get_member(int(user_id))
+                            user_name = member.display_name if member else f"Unknown User ({user_id})"
+                            role_data.append({
+                                "event_title": event.get("title", "Unknown Event"),
+                                "event_date": event_date,
+                                "user_name": user_name,
+                                "user_id": user_id
+                            })
+
+            # Output the data
+            if output_format == "discord":
+                if not role_data:
+                    await interaction.followup.send(
+                        f"No attendance data found for role '{role_name}'.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Group by event
+                events_dict = {}
+                for entry in role_data:
+                    event_key = f"{entry['event_title']} ({entry['event_date']})"
+                    if event_key not in events_dict:
+                        events_dict[event_key] = []
+                    events_dict[event_key].append(entry['user_name'])
+
+                # Create an embed to display the data
+                embed = discord.Embed(
+                    title=f"Attendance for Role '{role_name}'",
+                    color=discord.Color.blue()
+                )
+
+                # Add fields for each event (up to 25 fields max)
+                for i, (event_name, users) in enumerate(list(events_dict.items())[:25]):
+                    embed.add_field(
+                        name=event_name,
+                        value="\n".join(users[:10]) + (f"\n...and {len(users) - 10} more" if len(users) > 10 else ""),
+                        inline=True
+                    )
+
+                if len(events_dict) > 25:
+                    embed.set_footer(text=f"Showing 25 of {len(events_dict)} events. Use CSV export to see all.")
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:  # CSV
+                csv_data = io.StringIO()
+                writer = csv.writer(csv_data)
+                writer.writerow(["Event Title", "Event Date", "User", "User ID"])
+
+                for entry in role_data:
+                    writer.writerow([
+                        entry["event_title"],
+                        entry["event_date"],
+                        entry["user_name"],
+                        entry["user_id"]
+                    ])
+
+                csv_data.seek(0)
+                file = discord.File(
+                    fp=io.BytesIO(csv_data.getvalue().encode()),
+                    filename=f"role_{role_name}_attendance.csv"
+                )
+                await interaction.followup.send(
+                    f"Here's the attendance data for role '{role_name}':",
+                    file=file,
+                    ephemeral=True
+                )
+
+        elif view_type == "date":
+            # Get date attendance data
+            date_data = []
+            for event_id, event in guild_events.items():
+                event_time_str = event.get("time", "Unknown")
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_date = event_time.strftime("%Y-%m-%d")
+                except ValueError:
+                    event_date = "Unknown"
+
+                # Check if event matches the filter date
+                if event_date == date:  # Compare string to string
+                    for role_id, role_data_item in event.get("roles", {}).items():
+                        if role_data_item.get("name"):
+                            for user_id in role_data_item.get("users", []):
+                                member = interaction.guild.get_member(int(user_id))
+                                user_name = member.display_name if member else f"Unknown User ({user_id})"
+                                date_data.append({
+                                    "event_title": event.get("title", "Unknown Event"),
+                                    "role": role_data_item.get("name", "Unknown Role"),
+                                    "user_name": user_name,
+                                    "user_id": user_id
+                                })
+
+            # Output the data
+            if output_format == "discord":
+                if not date_data:
+                    await interaction.followup.send(
+                        f"No attendance data found for date '{date}'.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Group by event and role
+                events_dict = {}
+                for entry in date_data:
+                    event_key = entry['event_title']
+                    role_key = entry['role']
+
+                    if event_key not in events_dict:
+                        events_dict[event_key] = {}
+
+                    if role_key not in events_dict[event_key]:
+                        events_dict[event_key][role_key] = []
+
+                    events_dict[event_key][role_key].append(entry['user_name'])
+
+                # Create an embed to display the data
+                embed = discord.Embed(
+                    title=f"Attendance for Date '{date}'",
+                    color=discord.Color.blue()
+                )
+
+                # Add fields for each event and role
+                for event_name, roles in events_dict.items():
+                    for role_name, users in roles.items():
+                        embed.add_field(
+                            name=f"{event_name} - {role_name} ({len(users)})",
+                            value="\n".join(users[:10]) + (
+                                f"\n...and {len(users) - 10} more" if len(users) > 10 else ""),
+                            inline=True
+                        )
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:  # CSV
+                csv_data = io.StringIO()
+                writer = csv.writer(csv_data)
+                writer.writerow(["Event Title", "Role", "User", "User ID"])
+
+                for entry in date_data:
+                    writer.writerow([
+                        entry["event_title"],
+                        entry["role"],
+                        entry["user_name"],
+                        entry["user_id"]
+                    ])
+
+                csv_data.seek(0)
+                file = discord.File(
+                    fp=io.BytesIO(csv_data.getvalue().encode()),
+                    filename=f"date_{date}_attendance.csv"
+                )
+                await interaction.followup.send(
+                    f"Here's the attendance data for date '{date}':",
+                    file=file,
+                    ephemeral=True
+                )
+
+        elif view_type == "all":
+            # Get all attendance data
+            all_data = []
+            for event_id, event in guild_events.items():
+                event_time_str = event.get("time", "Unknown")
+                try:
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_date = event_time.strftime("%Y-%m-%d")
+                except ValueError:
+                    event_date = "Unknown"
+
+                for role_id, role_data_item in event.get("roles", {}).items():
+                    if role_data_item.get("name"):
+                        for user_id in role_data_item.get("users", []):
+                            member = interaction.guild.get_member(int(user_id))
+                            user_name = member.display_name if member else f"Unknown User ({user_id})"
+                            all_data.append({
+                                "event_title": event.get("title", "Unknown Event"),
+                                "event_date": event_date,
+                                "role": role_data_item.get("name", "Unknown Role"),
+                                "user_name": user_name,
+                                "user_id": user_id
+                            })
+
+            # Output the data
+            if output_format == "discord":
+                if not all_data:
+                    await interaction.followup.send("No attendance data found.", ephemeral=True)
+                    return
+
+                # For "all" data, it's usually too much for Discord embeds
+                # So we'll summarize by event
+                events_summary = {}
+                for entry in all_data:
+                    event_key = f"{entry['event_title']} ({entry['event_date']})"
+                    if event_key not in events_summary:
+                        events_summary[event_key] = {"total": 0, "roles": {}}
+
+                    events_summary[event_key]["total"] += 1
+
+                    role_name = entry["role"]
+                    if role_name not in events_summary[event_key]["roles"]:
+                        events_summary[event_key]["roles"][role_name] = 0
+
+                    events_summary[event_key]["roles"][role_name] += 1
+
+                # Create an embed to display the summary
+                embed = discord.Embed(
+                    title="Attendance Summary",
+                    description=f"Total Events: {len(events_summary)}",
+                    color=discord.Color.blue()
+                )
+
+                # Add fields for each event (up to 25 fields max)
+                for i, (event_name, data) in enumerate(list(events_summary.items())[:25]):
+                    role_summary = "\n".join([f"{role}: {count}" for role, count in data["roles"].items()])
+                    embed.add_field(
+                        name=f"{event_name} (Total: {data['total']})",
+                        value=role_summary or "No roles",
+                        inline=True
+                    )
+
+                if len(events_summary) > 25:
+                    embed.set_footer(text=f"Showing 25 of {len(events_summary)} events. Use CSV export to see all.")
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:  # CSV
+                csv_data = io.StringIO()
+                writer = csv.writer(csv_data)
+                writer.writerow(["Event Title", "Event Date", "Role", "User", "User ID"])
+
+                for entry in all_data:
+                    writer.writerow([
+                        entry["event_title"],
+                        entry["event_date"],
+                        entry["role"],
+                        entry["user_name"],
+                        entry["user_id"]
+                    ])
+
+                csv_data.seek(0)
+                file = discord.File(
+                    fp=io.BytesIO(csv_data.getvalue().encode()),
+                    filename="all_attendance.csv"
+                )
+                await interaction.followup.send(
+                    "Here's all attendance data:",
+                    file=file,
+                    ephemeral=True
+                )
+
+        else:
+            await interaction.followup.send(
+                "Invalid view type. Please use 'user', 'role', 'date', or 'all'.",
+                ephemeral=True
+            )
