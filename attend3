@@ -1,130 +1,3 @@
-    async def schedule_next_occurrence(self, event_id):
-        """Schedule the next occurrence of a recurring event"""
-        try:
-            print(f"Scheduling next occurrence for event {event_id}")
-            # Check if the event exists
-            if event_id not in self.events:
-                print(f"Event {event_id} not found")
-                return False
-
-            event = self.events[event_id]
-
-            # Check if the event is recurring
-            if not event.get("recurring"):
-                print(f"Event {event_id} is not recurring")
-                return False
-
-            # Get the recurrence rule
-            recurrence_rule = event.get("recurrence_rule")
-            if not recurrence_rule:
-                print(f"Event {event_id} has no recurrence rule, using default weekly recurrence")
-                recurrence_rule = "FREQ=WEEKLY"
-                self.events[event_id]["recurrence_rule"] = recurrence_rule
-                await self.save_events(event.get("guild_id"))
-
-            # Get the event time
-            event_time_str = event.get("time")
-            if not event_time_str:
-                print(f"Event {event_id} has no time")
-                return False
-
-            # Parse the event time
-            try:
-                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
-                event_time = event_time.replace(tzinfo=pytz.UTC)
-            except ValueError:
-                print(f"Invalid time format for event {event_id}: {event_time_str}")
-                return False
-
-            # Get the current time
-            now = datetime.now(pytz.UTC)
-
-            # Calculate time difference
-            time_diff = event_time - now
-
-            # Only proceed if the event is in the past
-            if time_diff.total_seconds() >= 0:
-                print(f"Event {event_id} is still in the future, not scheduling next occurrence yet")
-                return False
-
-            print(f"Event {event_id} is in the past, scheduling next occurrence")
-
-            # Create a new event for the next occurrence
-            from dateutil.rrule import rrulestr
-            try:
-                # Parse the recurrence rule
-                rrule_str = f"DTSTART:{event_time.strftime('%Y%m%dT%H%M%SZ')}\n"
-                rrule_str += f"RRULE:{recurrence_rule}"
-
-                # Get the next occurrence after now
-                rule = rrulestr(rrule_str, dtstart=event_time)
-                next_occurrence = rule.after(now, inc=False)
-
-                if not next_occurrence:
-                    print(f"No future occurrences found for event {event_id}")
-                    # Delete the old event since there are no more occurrences
-                    await self.delete_event(event_id)
-                    return False
-
-                print(f"Next occurrence for event {event_id}: {next_occurrence}")
-
-                # Calculate time until next occurrence
-                time_to_next = next_occurrence - now
-
-                # Create a new event based on the current one
-                new_event = copy.deepcopy(event)
-                new_event["time"] = next_occurrence.strftime("%Y-%m-%d %H:%M")
-
-                # Generate a new ID
-                new_id = f"{event['title']}_{len(self.events) + 1}_{new_event['time'].replace(' ', '_').replace(':', '-')}"
-
-                # Reset message and thread IDs
-                if "message_id" in new_event:
-                    del new_event["message_id"]
-                if "thread_id" in new_event:
-                    del new_event["thread_id"]
-
-                # Reset user lists
-                for role_id in new_event["roles"]:
-                    new_event["roles"][role_id]["users"] = []
-                new_event["event_role_users"] = []
-
-                # Add the new event
-                self.events[new_id] = new_event
-                await self.save_events(event.get("guild_id"))
-
-                # Schedule posting based on timing
-                if time_to_next.total_seconds() > 3 * 24 * 60 * 60:
-                    # More than 3 days away, schedule to post 3 days before
-                    post_delay = time_to_next.total_seconds() - (3 * 24 * 60 * 60)
-                    print(f"Next occurrence is more than 3 days away, scheduling post in {post_delay} seconds")
-
-                    self.recurring_tasks[new_id] = self.bot.loop.create_task(
-                        self.post_event_message(new_id, timedelta(seconds=post_delay))
-                    )
-                else:
-                    # Less than 3 days away, post immediately
-                    print(f"Next occurrence is less than 3 days away, posting immediately")
-                    await self.update_event_message(new_id)
-
-                # Now delete the old event (this should happen regardless of timing)
-                print(f"Deleting old event {event_id} after scheduling next occurrence")
-                await self.delete_event(event_id)
-
-                return True
-
-            except Exception as e:
-                print(f"Error scheduling next occurrence: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
-
-        except Exception as e:
-            print(f"Error in schedule_next_occurrence: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
     async def remove_event_roles(self, event_id):
         """Remove all Discord roles associated with an event"""
         try:
@@ -275,19 +148,24 @@
         """Post an event message after a delay"""
         try:
             await asyncio.sleep(delay.total_seconds())
+
             if event_id not in self.events:
                 print(f"Event {event_id} not found when trying to post message")
                 return
+
             event = self.events[event_id]
+
             # Check if the message has already been posted
             if "message_id" in event and event["message_id"]:
                 print(f"Event {event_id} already has a message, skipping post")
                 return
+
             # Get the channel
             channel_id = event.get("channel_id")
             if not channel_id:
                 print(f"Event {event_id} has no channel_id")
                 return
+
             channel = self.bot.get_channel(int(channel_id))
             if not channel:
                 print(f"Channel {channel_id} not found for event {event_id}")
@@ -297,7 +175,7 @@
             embed = await self.create_event_embed(event_id)
             view = AttendanceView(self, event_id)
 
-            # NEW: Check for staff ping
+            # Check for staff ping
             content = None
             if event.get("staff_ping_role_id"):
                 guild = self.bot.get_guild(int(event["guild_id"]))
@@ -311,25 +189,31 @@
 
             # Update the event with the message ID
             self.events[event_id]["message_id"] = str(message.id)
+
             # Save the events
             await self.save_events(event.get("guild_id"), update_message=False)
             print(f"Posted message for event {event_id}: {message.id}")
 
-            # Rest of the method remains the same...
             # Schedule reminder for the event
             event_time_str = event["time"]
             event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
             reminder_diff = event_time - datetime.now(pytz.UTC)
+
             if reminder_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
                 self.reminder_tasks[event_id] = self.bot.loop.create_task(
                     self.send_reminder(event_id, reminder_diff)
                 )
+
             # Schedule cleanup for the event (2 days after)
             cleanup_time = event_time + timedelta(days=2)
             cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
-            self.cleanup_tasks[event_id] = self.bot.loop.create_task(
-                self.cleanup_event(event_id, cleanup_diff)
-            )
+
+            if cleanup_diff.total_seconds() > 0:
+                print(f"Scheduling cleanup for event {event_id} in {cleanup_diff.total_seconds()} seconds")
+                self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                    self.cleanup_event(event_id, cleanup_diff)
+                )
+
         except Exception as e:
             print(f"Error posting event message: {e}")
             import traceback
@@ -441,5 +325,267 @@
                 traceback.print_exc()
         except Exception as e:
             print(f"Error in post_recurring_event for {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def send_reminder(self, event_id, time_diff):
+        """Send a reminder for an event"""
+        try:
+            # Wait until 30 minutes before the event
+            reminder_time = time_diff.total_seconds() - 1800  # 30 minutes in seconds
+            print(f"Scheduling reminder for event {event_id} in {reminder_time} seconds")
+            if reminder_time > 0:
+                await asyncio.sleep(reminder_time)
+
+            print(f"Sending reminder for event {event_id}")
+
+            # Check if the event still exists
+            event = self.events.get(event_id)
+            if not event:
+                print(f"Event {event_id} no longer exists")
+                return
+
+            # Check if we've already sent a reminder for this event
+            last_reminder_key = f"last_reminder_{event_id}"
+            if last_reminder_key in event:
+                try:
+                    event_time = datetime.strptime(event.get("time"), "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                    last_reminder_time = datetime.strptime(event[last_reminder_key], "%Y-%m-%d %H:%M")
+                    last_reminder_time = last_reminder_time.replace(tzinfo=pytz.UTC)
+                    # If we've already sent a reminder after the event was created, don't send another one
+                    if last_reminder_time > event_time - timedelta(hours=1):  # Within 1 hour of event time
+                        print(f"Already sent a reminder for event {event_id} recently")
+                        return
+                except Exception as e:
+                    print(f"Error checking last reminder time: {e}")
+                    # Continue with sending the reminder
+
+            # Get the guild and channel
+            guild = self.bot.get_guild(int(event["guild_id"]))
+            if not guild:
+                print(f"Guild {event['guild_id']} not found for event {event_id}")
+                return
+
+            channel = guild.get_channel(int(event["channel_id"]))
+            if not channel:
+                print(f"Channel {event['channel_id']} not found for event {event_id}")
+                return
+
+            # Get the message
+            try:
+                message = await channel.fetch_message(int(event["message_id"]))
+                print(f"Found message for event {event_id}")
+            except Exception as e:
+                print(f"Error fetching message for event {event_id}: {e}")
+                return
+
+            # Always create a NEW thread for each event occurrence
+            thread = None
+            try:
+                print(f"Creating new thread for event {event_id}")
+                thread = await message.create_thread(
+                    name=f"Discussion: {event['title']} - {event.get('time', '')}",
+                    auto_archive_duration=1440  # 24 hours
+                )
+                # Save the thread ID to the event data
+                self.events[event_id]["thread_id"] = thread.id
+                await self.save_events(int(event["guild_id"]))
+                print(f"Thread created for event {event_id}: {thread.id}")
+            except Exception as e:
+                print(f"Error creating thread for event {event_id}: {e}")
+                return
+
+            # Format the reminder message
+            title = event.get('title', 'Untitled Event')
+            location = event.get('location', 'Not specified')
+
+            # Parse the event time
+            event_time_str = event.get('time', '')
+            try:
+                event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.UTC)
+                # Format as Discord timestamp for local time conversion
+                # This will show the time in each user's local timezone
+                discord_timestamp = f"<t:{int(event_time.timestamp())}:F>"
+                start_time = discord_timestamp
+            except ValueError:
+                start_time = event_time_str
+
+            # Build the reminder message
+            reminder_message = "Look alive! We start in 30 minutes!\n\n"
+            reminder_message += f"{title}\n"
+            reminder_message += f"Location: {location}\n"
+            reminder_message += f"Start time: {start_time}\n\n"
+
+            # Add pings section
+            pings = []
+
+            # First add the pingable role if it exists
+            if event.get("event_role_id"):
+                role = guild.get_role(int(event["event_role_id"]))
+                if role:
+                    pings.append(role.mention)
+
+            # Then add individual user pings
+            for role_id, role_data in event["roles"].items():
+                for user_id in role_data.get("users", []):
+                    pings.append(f"<@{user_id}>")
+
+            # Add the pings to the message if there are any
+            if pings:
+                reminder_message += " ".join(pings)
+
+            # Send the reminder in the thread
+            try:
+                await thread.send(reminder_message)
+                print(f"Sent reminder for event {event_id} in thread")
+
+                # Record that we sent a reminder
+                self.events[event_id][f"last_reminder_{event_id}"] = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+                await self.save_events(int(event["guild_id"]))
+
+            except Exception as e:
+                print(f"Error sending reminder in thread for event {event_id}: {e}")
+
+        except asyncio.CancelledError:
+            # Task was cancelled, that's fine
+            print(f"Reminder task for event {event_id} was cancelled")
+        except Exception as e:
+            print(f"Unexpected error in send_reminder for event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def cleanup_event(self, event_id, time_diff):
+        """Clean up an event after it's over"""
+        try:
+            # Wait until 2 days after the event
+            cleanup_delay = time_diff.total_seconds() + 2 * 24 * 60 * 60
+            if cleanup_delay > 0:
+                print(f"Scheduling cleanup for event {event_id} in {cleanup_delay} seconds")
+                await asyncio.sleep(cleanup_delay)
+
+            print(f"Starting cleanup for event {event_id}")
+
+            # Check if the event still exists
+            if event_id not in self.events:
+                print(f"Event {event_id} no longer exists, skipping cleanup.")
+                return
+
+            event = self.events[event_id]
+
+            # Remove all Discord roles associated with the event
+            await self.remove_event_roles(event_id)
+
+            # Delete the event message if it exists
+            if "message_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        try:
+                            message = await channel.fetch_message(int(event.get("message_id")))
+                            await message.delete()
+                            print(f"Deleted message for event {event_id}")
+                        except discord.NotFound:
+                            print(f"Message for event {event_id} already deleted")
+                except Exception as e:
+                    print(f"Error deleting message for event {event_id}: {e}")
+
+            # Delete the thread if it exists
+            if "thread_id" in event and "channel_id" in event:
+                try:
+                    channel = self.bot.get_channel(int(event.get("channel_id")))
+                    if channel:
+                        thread = channel.get_thread(int(event.get("thread_id")))
+                        if thread:
+                            await thread.delete()
+                            print(f"Deleted thread for event {event_id}")
+                except Exception as e:
+                    print(f"Error deleting thread for event {event_id}: {e}")
+
+            # Handle recurring vs non-recurring events
+            if event.get("recurring"):
+                print(f"Event {event_id} is recurring, scheduling next occurrence")
+                # For recurring events, schedule the next occurrence
+                await self.schedule_next_occurrence(event_id)
+            else:
+                print(f"Event {event_id} is not recurring, removing from storage")
+                # For non-recurring events, just delete
+                del self.events[event_id]
+                await self.save_events(event.get("guild_id"))
+
+            # Clean up the cleanup task
+            if event_id in self.cleanup_tasks:
+                del self.cleanup_tasks[event_id]
+
+            print(f"Cleanup completed for event {event_id}")
+
+        except asyncio.CancelledError:
+            print(f"Cleanup task for event {event_id} was cancelled")
+        except Exception as e:
+            print(f"Error during cleanup of event {event_id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def cleanup_old_events(self):
+        """Clean up old events on startup"""
+        try:
+            now = self.get_time_provider().now(pytz.UTC)
+            print(f"Cleaning up old events at {now}")
+            cleanup_count = 0
+            next_occurrence_count = 0
+
+            # Create a copy of the events list to avoid modification during iteration
+            events_to_process = list(self.events.items())
+
+            for event_id, event in events_to_process:
+                try:
+                    # Double-check the event still exists (in case another process deleted it)
+                    if event_id not in self.events:
+                        print(f"Event {event_id} was already deleted, skipping")
+                        continue
+
+                    # Skip events that don't have a time
+                    if not event.get("time"):
+                        continue
+
+                    # Parse the event time
+                    event_time_str = event.get("time")
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+
+                    # Calculate time difference
+                    time_diff = event_time - now
+
+                    # If this is a non-recurring event that's more than 2 days old
+                    if not event.get("recurring") and time_diff.total_seconds() < -2 * 24 * 60 * 60:
+                        print(f"Cleaning up old non-recurring event: {event_id}")
+                        if await self.delete_event(event_id):
+                            cleanup_count += 1
+
+                    # If this is a recurring event that's more than 2 days old
+                    elif event.get("recurring") and time_diff.total_seconds() < -2 * 24 * 60 * 60:
+                        print(f"Scheduling next occurrence for old recurring event: {event_id}")
+                        await self.schedule_next_occurrence(event_id)
+                        next_occurrence_count += 1
+
+                    # If this is a future event, schedule its cleanup
+                    elif time_diff.total_seconds() > 0:
+                        cleanup_time = event_time + timedelta(days=2)
+                        cleanup_diff = cleanup_time - now
+                        if cleanup_diff.total_seconds() > 0:
+                            print(f"Scheduling cleanup for future event {event_id}")
+                            self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                                self.cleanup_event(event_id, time_diff)
+                            )
+
+                except Exception as e:
+                    print(f"Error processing event {event_id} during cleanup: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            print(
+                f"Cleanup completed: {cleanup_count} events cleaned up, {next_occurrence_count} recurring events scheduled")
+
+        except Exception as e:
+            print(f"Error during cleanup_old_events: {e}")
             import traceback
             traceback.print_exc()
