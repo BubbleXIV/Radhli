@@ -1,0 +1,516 @@
+    @app_commands.command(name="create", description="Create a new attendance event")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def create_attendance(self, interaction: discord.Interaction):
+        """Create a new attendance event"""
+        # Load events for this guild if not already loaded
+        await self.load_events(interaction.guild.id)
+        await interaction.response.send_message("Let's create a new attendance event. I'll ask you some questions.",
+                                                ephemeral=True)
+        # Ask for title
+        await interaction.followup.send("What's the title of the event?", ephemeral=True)
+
+        # We need to wait for a message in the channel from this user
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+
+        try:
+            title_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            title = title_msg.content
+            # Delete the user's message to keep the channel clean
+            try:
+                await title_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for description
+        await interaction.followup.send("Please provide a description for the event:", ephemeral=True)
+        try:
+            desc_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            description = desc_msg.content
+            try:
+                await desc_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for time
+        await interaction.followup.send("When will the event take place? (Format: YYYY-MM-DD HH:MM in EST timezone)",
+                                        ephemeral=True)
+        while True:
+            try:
+                time_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                event_time_str = time_msg.content
+                # Validate time format
+                try:
+                    # Parse the input time string
+                    naive_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    # Convert EST to UTC for storage
+                    est = timezone('US/Eastern')
+                    est_time = est.localize(naive_time)
+                    utc_time = est_time.astimezone(pytz.UTC)
+                    # Store in UTC format
+                    event_time = utc_time.strftime("%Y-%m-%d %H:%M")
+                    try:
+                        await time_msg.delete()
+                    except:
+                        pass
+                    break
+                except ValueError as e:
+                    print(f"Time parsing error: {e}")
+                    await interaction.followup.send("Invalid time format. Please use YYYY-MM-DD HH:MM", ephemeral=True)
+                    try:
+                        await time_msg.delete()
+                    except:
+                        pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for location
+        await interaction.followup.send("Where will the event take place?", ephemeral=True)
+        try:
+            location_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            location = location_msg.content
+            try:
+                await location_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for embed ping
+        await interaction.followup.send(
+            "Would you like to add a staff ping when this event is posted? This will ping staff members every time the event goes out (including recurring events). (yes/no)",
+            ephemeral=True
+        )
+        try:
+            staff_ping_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            wants_staff_ping = staff_ping_msg.content.lower() in ["yes", "y", "true"]
+            try:
+                await staff_ping_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        staff_ping_role_id = None
+        if wants_staff_ping:
+            await interaction.followup.send(
+                "Please mention the role to ping, enter its ID, or name:",
+                ephemeral=True
+            )
+            try:
+                ping_role_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                # Check for role mentions first
+                if ping_role_msg.role_mentions:
+                    role = ping_role_msg.role_mentions[0]
+                    staff_ping_role_id = role.id
+                    await interaction.followup.send(f"Staff ping role set to: {role.name}", ephemeral=True)
+                else:
+                    # Try to find the role by ID
+                    try:
+                        role_id = int(ping_role_msg.content.strip())
+                        role = interaction.guild.get_role(role_id)
+                    except ValueError:
+                        # If not an ID, try to find by name
+                        role_name = ping_role_msg.content.strip()
+                        role = discord.utils.get(interaction.guild.roles, name=role_name)
+
+                    if role:
+                        staff_ping_role_id = role.id
+                        await interaction.followup.send(f"Staff ping role set to: {role.name}", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Role not found. No staff ping will be added.", ephemeral=True)
+                        staff_ping_role_id = None
+
+                try:
+                    await ping_role_msg.delete()
+                except:
+                    pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for channel
+        await interaction.followup.send(
+            f"Which channel should the event be posted in? Please enter the channel name, ID, or mention a channel.",
+            ephemeral=True)
+        while True:
+            try:
+                channel_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                # Check for channel mentions first
+                if channel_msg.channel_mentions:
+                    target_channel = channel_msg.channel_mentions[0]
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+                    break
+                # Try to find the channel by ID
+                try:
+                    channel_id = int(channel_msg.content.strip())
+                    target_channel = interaction.guild.get_channel(channel_id)
+                except ValueError:
+                    # If not an ID, try to find by name
+                    channel_name = channel_msg.content.strip().lower()
+                    target_channel = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+                if target_channel:
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+                    break
+                else:
+                    await interaction.followup.send(f"Channel not found in {interaction.guild.name}. Please try again.",
+                                                    ephemeral=True)
+                    try:
+                        await channel_msg.delete()
+                    except:
+                        pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Ask for recurring
+        await interaction.followup.send("Should this event repeat? (yes/no)", ephemeral=True)
+        try:
+            recurring_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            recurring = recurring_msg.content.lower() in ["yes", "y", "true"]
+            try:
+                await recurring_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        recurring_interval = 0
+        if recurring:
+            # Ask for recurring interval
+            await interaction.followup.send(
+                "How often should it repeat? (Enter number of weeks: 1 for weekly, 2 for biweekly, etc.)",
+                ephemeral=True)
+            while True:
+                try:
+                    interval_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                    recurring_interval = int(interval_msg.content)
+                    if recurring_interval <= 0:
+                        await interaction.followup.send("Please enter a positive number.", ephemeral=True)
+                        try:
+                            await interval_msg.delete()
+                        except:
+                            pass
+                    else:
+                        try:
+                            await interval_msg.delete()
+                        except:
+                            pass
+                        break
+                except ValueError:
+                    await interaction.followup.send("Please enter a valid number.", ephemeral=True)
+                    try:
+                        await interval_msg.delete()
+                    except:
+                        pass
+                except asyncio.TimeoutError:
+                    return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Now set up the roles
+        roles = {}
+        # Get the restricted role IDs
+        restricted_role_ids = []
+        for i in range(4):  # Changed to 4 restricted roles as per requirements
+            await interaction.followup.send(
+                f"For restricted role #{i + 1}, please mention the role, enter its ID, or name (or type 'skip' to skip this restricted role):",
+                ephemeral=True)
+            try:
+                role_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                if role_msg.content.lower() == "skip":
+                    restricted_role_ids.append(None)
+                    try:
+                        await role_msg.delete()
+                    except:
+                        pass
+                    continue
+                # Check for role mentions first
+                if role_msg.role_mentions:
+                    role = role_msg.role_mentions[0]
+                    restricted_role_ids.append(role.id)
+                    await interaction.followup.send(f"Found role: {role.name}", ephemeral=True)
+                else:
+                    # Try to find the role by ID
+                    try:
+                        role_id = int(role_msg.content.strip())
+                        role = interaction.guild.get_role(role_id)
+                    except ValueError:
+                        # If not an ID, try to find by name
+                        role_name = role_msg.content.strip()
+                        role = discord.utils.get(interaction.guild.roles, name=role_name)
+                    if role:
+                        restricted_role_ids.append(role.id)
+                        await interaction.followup.send(f"Found role: {role.name}", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Role not found. Skipping this restricted role.",
+                                                        ephemeral=True)
+                        restricted_role_ids.append(None)
+                # Delete the user's message to keep the channel clean
+                try:
+                    await role_msg.delete()
+                except:
+                    pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Create roles (up to 10, with skippable options)
+        max_roles = 10
+        role_count = 0
+        # First handle restricted roles
+        for i in range(4):  # Changed to 4 restricted roles
+            # Skip if no required role was specified
+            if i >= len(restricted_role_ids) or restricted_role_ids[i] is None:
+                role_id = f"role_{i + 1}"
+                roles[role_id] = {
+                    "name": None,  # No name means this role is skipped
+                    "restricted": True,
+                    "users": [],
+                    "required_role_id": None
+                }
+                continue
+            await interaction.followup.send(f"Name for restricted role #{i + 1}:", ephemeral=True)
+            try:
+                role_name_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                role_name = role_name_msg.content
+                try:
+                    await role_name_msg.delete()
+                except:
+                    pass
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+            role_id = f"role_{i + 1}"
+            roles[role_id] = {
+                "name": role_name,
+                "restricted": True,
+                "users": [],
+                "required_role_id": restricted_role_ids[i]
+            }
+            role_count += 1
+
+        # Now handle open roles (6 open roles as per requirements)
+        for i in range(4, 4 + 6):  # 4 restricted + 6 open = 10 total
+            await interaction.followup.send(
+                f"Name for open role #{i + 1 - 4} (or type 'skip' to skip, or 'done' if you're finished adding roles):",
+                ephemeral=True)
+            try:
+                role_name_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                role_name = role_name_msg.content
+                try:
+                    await role_name_msg.delete()
+                except:
+                    pass
+                if role_name.lower() == "done":
+                    break
+                if role_name.lower() == "skip":
+                    role_id = f"role_{i + 1}"
+                    roles[role_id] = {
+                        "name": None,  # No name means this role is skipped
+                        "restricted": False,
+                        "users": [],
+                        "required_role_id": None
+                    }
+                    continue
+                role_id = f"role_{i + 1}"
+                roles[role_id] = {
+                    "name": role_name,
+                    "restricted": False,
+                    "users": [],
+                    "required_role_id": None
+                }
+                role_count += 1
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # NEW: Ask if a pingable role should be assigned to participants
+        await interaction.followup.send(
+            "Would you like to assign a pingable role to everyone who signs up for this event? (yes/no)",
+            ephemeral=True
+        )
+        try:
+            pingable_msg = await self.bot.wait_for("message", check=check, timeout=300)
+            assign_pingable_role = pingable_msg.content.lower() in ["yes", "y", "true"]
+            try:
+                await pingable_msg.delete()
+            except:
+                pass
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        event_role_id = None
+        if assign_pingable_role:
+            # Ask if they want to create a new role or use an existing one
+            await interaction.followup.send(
+                "Would you like to create a new role or use an existing one? (new/existing)",
+                ephemeral=True
+            )
+            try:
+                role_choice_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                create_new_role = role_choice_msg.content.lower() in ["new", "n", "create"]
+                try:
+                    await role_choice_msg.delete()
+                except:
+                    pass
+                if create_new_role:
+                    # Create a new role
+                    role_name = f"Event: {title}"
+                    new_role = await interaction.guild.create_role(
+                        name=role_name,
+                        mentionable=True,
+                        reason=f"Created for event: {title}"
+                    )
+                    event_role_id = new_role.id
+                    await interaction.followup.send(f"Created new role: {new_role.name}", ephemeral=True)
+                else:
+                    # Use an existing role
+                    await interaction.followup.send(
+                        "Please mention the role, enter its ID, or name:",
+                        ephemeral=True
+                    )
+                    try:
+                        existing_role_msg = await self.bot.wait_for("message", check=check, timeout=300)
+                        # Check for role mentions first
+                        if existing_role_msg.role_mentions:
+                            role = existing_role_msg.role_mentions[0]
+                            event_role_id = role.id
+                            await interaction.followup.send(f"Using role: {role.name}", ephemeral=True)
+                        else:
+                            # Try to find the role by ID
+                            try:
+                                role_id = int(existing_role_msg.content.strip())
+                                role = interaction.guild.get_role(role_id)
+                            except ValueError:
+                                # If not an ID, try to find by name
+                                role_name = existing_role_msg.content.strip()
+                                role = discord.utils.get(interaction.guild.roles, name=role_name)
+                            if role:
+                                event_role_id = role.id
+                                await interaction.followup.send(f"Using role: {role.name}", ephemeral=True)
+                            else:
+                                await interaction.followup.send("Role not found. No pingable role will be assigned.",
+                                                                ephemeral=True)
+                                event_role_id = None
+                        try:
+                            await existing_role_msg.delete()
+                        except:
+                            pass
+                    except asyncio.TimeoutError:
+                        return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+            except asyncio.TimeoutError:
+                return await interaction.followup.send("Timed out. Please try again.", ephemeral=True)
+
+        # Create a unique event ID based on title and date
+        event_id = f"{title.replace(' ', '_')}_{naive_time.strftime('%Y-%m-%d_%H-%M')}"
+
+        # Create the event dictionary
+        event = {
+            "id": event_id,
+            "title": title,
+            "description": description,
+            "time": event_time,
+            "location": location,
+            "guild_id": interaction.guild.id,
+            "channel_id": target_channel.id,
+            "message_id": None,  # Will be updated after sending the message
+            "roles": roles,
+            "recurring": recurring,
+            "recurring_interval": recurring_interval,
+            "event_role_id": event_role_id,
+            "staff_ping_role_id": staff_ping_role_id,
+            "created_by": interaction.user.id,
+            "created_at": datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M")
+        }
+
+        # Save the event to the dictionary BEFORE creating the view
+        self.events[event_id] = event
+
+        # Create the embed
+        embed = await self.create_event_embed(event_id)
+
+        # Debug output before saving
+        print(f"Creating event with ID: {event_id}")
+        print(f"Event data: {event}")
+        print(f"Current events dict has {len(self.events)} events")
+        print(f"Guild ID in event: {event['guild_id']}, Type: {type(event['guild_id'])}")
+
+        # Send the message with the view
+        view = AttendanceView(self, event_id)
+
+        # Check for staff ping
+        content = None
+        if event.get("staff_ping_role_id"):
+            role = interaction.guild.get_role(int(event["staff_ping_role_id"]))
+            if role:
+                content = role.mention
+
+        message = await target_channel.send(content=content, embed=embed, view=view)
+
+        # Debug the message ID
+        print(f"Message sent with ID: {message.id}")
+
+        # Update the event with the message ID
+        self.events[event_id]["message_id"] = message.id
+        print(f"Updated event {event_id} with message_id: {self.events[event_id]['message_id']}")
+
+        # Make a copy of the event to verify it's saved correctly
+        event_copy = self.events[event_id].copy()
+
+        # Save the events
+        await self.save_events(interaction.guild.id)
+        print(f"Saved events for guild {interaction.guild.id}")
+
+        # Verify the message ID was saved by checking the actual saved data
+        # This is a critical step to ensure the message ID is persisted
+        events_file = os.path.join(self.data_dir, "events", f"events_{interaction.guild.id}.json")
+        if os.path.exists(events_file):
+            try:
+                with open(events_file, "r") as f:
+                    saved_events = json.load(f)
+                    if event_id in saved_events and 'message_id' in saved_events[event_id]:
+                        print(f"Verified saved message_id: {saved_events[event_id]['message_id']}")
+                    else:
+                        print(f"WARNING: message_id not found in saved event data!")
+                        # Try to fix it by saving again
+                        self.events[event_id] = event_copy  # Restore from our copy
+                        await self.save_events(interaction.guild.id)
+                        print(f"Attempted to fix by saving again")
+            except Exception as e:
+                print(f"Error verifying saved data: {e}")
+
+        # Schedule the reminder
+        event_time_dt = datetime.strptime(event_time, "%Y-%m-%d %H:%M")
+        event_time_dt = event_time_dt.replace(tzinfo=pytz.UTC)
+        time_diff = event_time_dt - datetime.now(pytz.UTC)
+
+        if time_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+            self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                self.send_reminder(event_id, time_diff)
+            )
+
+        # Schedule cleanup
+        event_time_dt = datetime.strptime(event_time, "%Y-%m-%d %H:%M")
+        event_time_dt = event_time_dt.replace(tzinfo=pytz.UTC)
+        # Keep this structure but pass the right parameter:
+        time_until_event = event_time_dt - datetime.now(pytz.UTC)
+        self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+            self.cleanup_event(event_id, time_until_event)
+        )
+
+        # If recurring, schedule the next occurrence
+        if recurring:
+            self.recurring_tasks[event_id] = self.bot.loop.create_task(
+                self.schedule_next_occurrence(event_id)
+            )
+
+        # Confirm to the user
+        await interaction.followup.send(
+            f"Event created successfully! Check {target_channel.mention} to see your event.",
+            ephemeral=True
+        )
