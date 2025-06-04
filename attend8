@@ -1,0 +1,248 @@
+    @app_commands.command(name="edit", description="Edit an existing attendance event")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def edit_event(self, interaction: discord.Interaction, event_id: str, field: str, value: str):
+        """Edit an existing attendance event"""
+        await self.load_events(interaction.guild.id)
+        event = self.events.get(event_id)
+        if not event:
+            return await interaction.response.send_message("Event not found.", ephemeral=True)
+        if event["guild_id"] != interaction.guild.id:
+            return await interaction.response.send_message("Event not found in this guild.", ephemeral=True)
+
+        # Update the field
+        if field.lower() == "title":
+            event["title"] = value
+        elif field.lower() == "description":
+            event["description"] = value
+        elif field.lower() == "time":
+            # Validate time format
+            try:
+                # Parse the input time string
+                naive_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
+                # Convert EST to UTC for storage
+                est = timezone('US/Eastern')
+                est_time = est.localize(naive_time)
+                utc_time = est_time.astimezone(pytz.UTC)
+                # Store in UTC format
+                event["time"] = utc_time.strftime("%Y-%m-%d %H:%M")
+                # Reschedule reminders and cleanup
+                event_time_dt = utc_time
+                time_diff = event_time_dt - datetime.now(pytz.UTC)
+                # Cancel existing tasks
+                await self.cancel_task_safely(self.reminder_tasks, event_id)
+                await self.cancel_task_safely(self.cleanup_tasks, event_id)
+                # Schedule new tasks
+                if time_diff.total_seconds() > 1800:  # Only schedule if more than 30 minutes away
+                    self.reminder_tasks[event_id] = self.bot.loop.create_task(
+                        self.send_reminder(event_id, time_diff)
+                    )
+                cleanup_time = event_time_dt + timedelta(days=1)
+                cleanup_diff = cleanup_time - datetime.now(pytz.UTC)
+                self.cleanup_tasks[event_id] = self.bot.loop.create_task(
+                    self.cleanup_event(event_id, cleanup_diff)
+                )
+            except ValueError:
+                return await interaction.response.send_message(
+                    "Invalid time format. Please use YYYY-MM-DD HH:MM",
+                    ephemeral=True
+                )
+        elif field.lower() == "location":
+            event["location"] = value
+        else:
+            return await interaction.response.send_message(
+                "Invalid field. Please use 'title', 'description', 'time', or 'location'.",
+                ephemeral=True
+            )
+
+        # Update the event message
+        await self.update_event_message(event_id)
+        # Save the updated event data
+        await self.save_events(event["guild_id"])
+        await interaction.response.send_message(f"Event '{event['title']}' has been updated.", ephemeral=True)
+
+    @app_commands.command(name="cleanup_events", description="Manually clean up old events")
+    @app_commands.describe(
+        force="Force cleanup of all past events regardless of age",
+        dry_run="Show what would be cleaned up without actually doing it")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def cleanup_events(
+            self,
+            interaction: discord.Interaction,
+            force: bool = False,
+            dry_run: bool = False):
+        """Manually trigger cleanup of old events"""
+        try:
+            # Check permissions
+            if not interaction.user.guild_permissions.manage_events:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.",
+                    ephemeral=True
+                )
+                return
+
+            # Send initial response
+            action = "Simulating" if dry_run else "Starting"
+            await interaction.response.send_message(f"{action} cleanup of old events...", ephemeral=True)
+
+            # CHANGE THIS LINE - use 'Attendance' instead of 'EventManager'
+            event_manager = self.bot.get_cog('Attendance')
+            if not event_manager:
+                await interaction.followup.send("❌ Attendance cog not found.", ephemeral=True)
+                return
+
+            # OR EVEN BETTER - just use self since this command is inside the Attendance cog
+            # Remove the event_manager lookup entirely and use self:
+
+            # Load events for this guild
+            await self.load_events(interaction.guild.id)
+
+            # Get current time
+            now = self.get_time_provider().now(pytz.UTC)
+            events_to_cleanup = []
+            recurring_events = []
+
+            # Analyze events - use self.events instead of event_manager.events
+            for event_id, event in self.events.items():
+                try:
+                    # Only process events for this guild
+                    if event.get("guild_id") != str(interaction.guild.id):
+                        continue
+
+                    if not event.get("time"):
+                        continue
+
+                    event_time_str = event.get("time")
+                    event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M")
+                    event_time = event_time.replace(tzinfo=pytz.UTC)
+                    time_since_event = now - event_time
+
+                    # Check cleanup criteria
+                    should_cleanup = False
+                    if force and time_since_event.total_seconds() > 0:  # Any past event if force
+                        should_cleanup = True
+                    elif time_since_event.total_seconds() > 2 * 24 * 60 * 60:  # More than 2 days
+                        should_cleanup = True
+
+                    if should_cleanup:
+                        events_to_cleanup.append({
+                            'id': event_id,
+                            'title': event.get('title', 'Untitled'),
+                            'time': event_time_str,
+                            'recurring': event.get('recurring', False),
+                            'days_old': time_since_event.days
+                        })
+                        if event.get('recurring'):
+                            recurring_events.append(event_id)
+
+                except Exception as e:
+                    print(f"Error analyzing event {event_id}: {e}")
+
+            # Create summary message
+            if not events_to_cleanup:
+                await interaction.followup.send(
+                    "✅ No old events found that need cleanup!",
+                    ephemeral=True
+                )
+                return
+
+            # Build detailed message
+            message_parts = []
+            if dry_run:
+                message_parts.append(f"🔍 **DRY RUN** - Found {len(events_to_cleanup)} events that would be cleaned up:")
+            else:
+                message_parts.append(f"🧹 Found {len(events_to_cleanup)} events to clean up:")
+
+            # Group events by type
+            non_recurring = [e for e in events_to_cleanup if not e['recurring']]
+            recurring = [e for e in events_to_cleanup if e['recurring']]
+
+            if non_recurring:
+                message_parts.append(f"\n**Non-recurring events to delete ({len(non_recurring)}):**")
+                for event in non_recurring[:5]:  # Show first 5
+                    message_parts.append(f"• {event['title']} ({event['days_old']} days old)")
+                if len(non_recurring) > 5:
+                    message_parts.append(f"• ... and {len(non_recurring) - 5} more")
+
+            if recurring:
+                message_parts.append(f"\n**Recurring events to update ({len(recurring)}):**")
+                for event in recurring[:5]:  # Show first 5
+                    message_parts.append(f"• {event['title']} (will schedule next occurrence)")
+                if len(recurring) > 5:
+                    message_parts.append(f"• ... and {len(recurring) - 5} more")
+
+            # Send summary
+            summary_message = "\n".join(message_parts)
+            await interaction.followup.send(summary_message, ephemeral=True)
+
+            # Actually perform cleanup if not dry run
+            if not dry_run:
+                cleaned_count = 0
+                errors = 0
+
+                for event_info in events_to_cleanup:
+                    try:
+                        event_id = event_info['id']
+                        # Use self instead of event_manager
+                        if event_id in self.events:
+                            event = self.events[event_id]
+
+                            # Remove roles
+                            await self.remove_event_roles(event_id)
+
+                            # Delete message
+                            if "message_id" in event and "channel_id" in event:
+                                try:
+                                    channel = interaction.guild.get_channel(int(event.get("channel_id")))
+                                    if channel:
+                                        try:
+                                            message = await channel.fetch_message(int(event.get("message_id")))
+                                            await message.delete()
+                                        except discord.NotFound:
+                                            pass  # Already deleted
+                                except Exception as e:
+                                    print(f"Error deleting message for event {event_id}: {e}")
+
+                            # Handle based on type
+                            if event.get("recurring"):
+                                await self.schedule_next_occurrence(event_id)
+                            else:
+                                del self.events[event_id]
+                                await self.save_events(interaction.guild.id)
+
+                            cleaned_count += 1
+
+                    except Exception as e:
+                        print(f"Error cleaning up event {event_info['id']}: {e}")
+                        errors += 1
+
+                # Send final results
+                result_message = f"✅ **Cleanup completed!**\n"
+                result_message += f"• Successfully processed: {cleaned_count} events\n"
+                if errors > 0:
+                    result_message += f"• Errors encountered: {errors} events\n"
+
+                # Count remaining events for this guild
+                remaining_events = len([e for e in self.events.values()
+                                        if e.get("guild_id") == str(interaction.guild.id)])
+                result_message += f"• Remaining events: {remaining_events}"
+
+                await interaction.followup.send(result_message, ephemeral=True)
+
+        except Exception as e:
+            print(f"Error in cleanup_events command: {e}")
+            import traceback
+            traceback.print_exc()
+            error_message = f"❌ An error occurred during cleanup: {str(e)}"
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(error_message, ephemeral=True)
+                else:
+                    await interaction.followup.send(error_message, ephemeral=True)
+            except:
+                pass
+
+
+async def setup(bot):
+    await bot.add_cog(Attendance(bot))
