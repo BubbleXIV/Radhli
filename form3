@@ -1,0 +1,382 @@
+    @app_commands.command(name="remove_question")
+    @app_commands.describe(
+        form_name="Name of the form to remove a question from",
+        question_number="The number of the question to remove (starts at 1)"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def remove_question(self, interaction: discord.Interaction, form_name: str, question_number: int):
+        """Removes a question from the specified form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            questions = self.forms[guild_id][form_name].get("questions", [])
+            if not questions:
+                await interaction.response.send_message(
+                    f"Form '{form_name}' has no questions to remove.",
+                    ephemeral=True
+                )
+                return
+
+            if question_number < 1 or question_number > len(questions):
+                await interaction.response.send_message(
+                    f"Invalid question number. Form '{form_name}' has {len(questions)} questions.",
+                    ephemeral=True
+                )
+                return
+
+            # Remove the question
+            removed_question = self.forms[guild_id][form_name]["questions"].pop(question_number - 1)
+            save_forms(self.forms)
+
+            embed = discord.Embed(
+                title="Question Removed",
+                description=f"Removed question #{question_number} from form '{form_name}':",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Removed Question", value=removed_question, inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="set_channel")
+    @app_commands.describe(
+        form_name="Name of the form to set the submission channel for",
+        channel="The channel where form submissions will be sent"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def set_channel(self, interaction: discord.Interaction, form_name: str, channel: discord.TextChannel):
+        """Sets the channel where form submissions will be sent"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            self.forms[guild_id][form_name]["submission_channel"] = channel.id
+            save_forms(self.forms)
+            embed = discord.Embed(
+                title="Submission Channel Set",
+                description=f"Form submissions for '{form_name}' will now be sent to {channel.mention}.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="toggle_approval")
+    @app_commands.describe(
+        form_name="Name of the form to toggle approval for",
+        enable="Whether to enable or disable the approval system"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def toggle_approval(self, interaction: discord.Interaction, form_name: str, enable: bool):
+        """Enables or disables the approval system for a form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            self.forms[guild_id][form_name]["enable_approval"] = enable
+            save_forms(self.forms)
+
+            status = "enabled" if enable else "disabled"
+            embed = discord.Embed(
+                title="Approval System Updated",
+                description=f"Approval system for '{form_name}' has been {status}.",
+                color=discord.Color.green()
+            )
+
+            # Update any existing button views
+            for location in self.forms[guild_id][form_name].get("button_locations", []):
+                try:
+                    channel_id, message_id = location
+                    channel = interaction.guild.get_channel(channel_id)
+                    if channel:
+                        message = await channel.fetch_message(message_id)
+                        if message:
+                            view = PersistentFormView.from_form_data(form_name, self.forms[guild_id][form_name])
+                            await message.edit(view=view)
+                except Exception as e:
+                    print(f"Error updating button view: {e}")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="deploy")
+    @app_commands.describe(
+        form_name="Name of the form to deploy",
+        channel="The channel where the form button will be placed",
+        title="Title for the form message",
+        description="Description for the form message"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def deploy_form(self, interaction: discord.Interaction, form_name: str, channel: discord.TextChannel,
+                          title: str, description: str):
+        """Deploys a form button to a channel"""
+        guild_id = str(interaction.guild.id)
+        # Reload forms from file to ensure we have the latest data
+        self.forms = load_forms()
+        if guild_id not in self.forms or form_name not in self.forms[guild_id]:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+            return
+
+        form_data = self.forms[guild_id][form_name]
+        # Debug the form data to see what's happening
+        print(f"Form data for {form_name}: {form_data}")
+
+        # Check if questions exist and is a non-empty list
+        if "questions" not in form_data or not isinstance(form_data["questions"], list) or len(
+                form_data["questions"]) == 0:
+            await interaction.response.send_message(
+                f"Form '{form_name}' has no questions. Add questions before deploying.",
+                ephemeral=True
+            )
+            return
+
+        if form_data.get("submission_channel") is None:
+            await interaction.response.send_message(
+                f"Form '{form_name}' has no submission channel set. Set a channel before deploying.",
+                ephemeral=True
+            )
+            return
+
+        # Store the display title in the form data
+        form_data["display_title"] = title
+
+        # Create an embed for the form
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=f"Form: {form_name}")
+
+        # Create a persistent view with the form button
+        enable_approval = form_data.get('enable_approval', False)
+        view = PersistentFormView(form_name, enable_approval, title)  # Pass the title
+
+        # Send the message with the button
+        form_message = await channel.send(embed=embed, view=view)
+
+        # Store the button location
+        if "button_locations" not in form_data:
+            form_data["button_locations"] = []
+
+        # Store as a tuple to maintain compatibility with existing data
+        form_data["button_locations"].append((channel.id, form_message.id))
+        save_forms(self.forms)
+
+        await interaction.response.send_message(
+            f"Form '{form_name}' has been deployed to {channel.mention}.",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="list")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def list_forms(self, interaction: discord.Interaction):
+        """Lists all forms for the current server"""
+        guild_id = str(interaction.guild.id)
+        if guild_id not in self.forms or not self.forms[guild_id]:
+            await interaction.response.send_message("No forms have been created for this server.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Forms for this server",
+            description="Here are all the forms that have been created:",
+            color=discord.Color.blue()
+        )
+
+        for form_name, form_data in self.forms[guild_id].items():
+            # Get form details
+            question_count = len(form_data.get("questions", []))
+            submission_channel_id = form_data.get("submission_channel")
+            submission_channel = (
+                interaction.guild.get_channel(submission_channel_id).mention
+                if submission_channel_id and interaction.guild.get_channel(submission_channel_id)
+                else "Not set"
+            )
+            approval_status = "Enabled" if form_data.get("enable_approval", False) else "Disabled"
+            button_count = len(form_data.get("button_locations", []))
+
+            # Add form as a field
+            embed.add_field(
+                name=form_name,
+                value=(
+                    f"Questions: {question_count}\n"
+                    f"Submission Channel: {submission_channel}\n"
+                    f"Approval System: {approval_status}\n"
+                    f"Button Deployments: {button_count}"
+                ),
+                inline=False
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="delete")
+    @app_commands.describe(form_name="Name of the form to delete")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_form(self, interaction: discord.Interaction, form_name: str):
+        """Deletes a form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            # Get button locations before deleting
+            button_locations = self.forms[guild_id][form_name].get("button_locations", [])
+
+            # Delete the form
+            del self.forms[guild_id][form_name]
+            save_forms(self.forms)
+
+            # Try to remove buttons
+            removed_buttons = 0
+            for location in button_locations:
+                try:
+                    channel_id, message_id = location
+                    channel = interaction.guild.get_channel(channel_id)
+                    if channel:
+                        message = await channel.fetch_message(message_id)
+                        if message:
+                            await message.edit(view=None)
+                            removed_buttons += 1
+                except Exception as e:
+                    print(f"Error removing button: {e}")
+
+            embed = discord.Embed(
+                title="Form Deleted",
+                description=f"Form '{form_name}' has been deleted.",
+                color=discord.Color.red()
+            )
+
+            if button_locations:
+                embed.add_field(
+                    name="Button Cleanup",
+                    value=f"Removed {removed_buttons}/{len(button_locations)} form buttons.",
+                    inline=False
+                )
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="debug_form")
+    @app_commands.describe(form_name="Name of the form to debug")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def debug_form(self, interaction: discord.Interaction, form_name: str):
+        """Displays detailed debug information about a form"""
+        guild_id = str(interaction.guild.id)
+
+        # Reload forms from file
+        fresh_forms = load_forms()
+
+        # Check both in-memory and file versions
+        memory_form = self.forms.get(guild_id, {}).get(form_name, {})
+        file_form = fresh_forms.get(guild_id, {}).get(form_name, {})
+
+        if not memory_form and not file_form:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+            return
+
+        # Create debug embed
+        embed = discord.Embed(
+            title=f"Debug Info for '{form_name}'",
+            color=discord.Color.gold()
+        )
+
+        # Compare in-memory vs file data
+        memory_questions = len(memory_form.get("questions", []))
+        file_questions = len(file_form.get("questions", []))
+
+        embed.add_field(
+            name="Question Count",
+            value=f"In-memory: {memory_questions}\nIn file: {file_questions}",
+            inline=False
+        )
+
+        # Show other important form properties
+        embed.add_field(
+            name="Submission Channel",
+            value=f"In-memory: {memory_form.get('submission_channel')}\nIn file: {file_form.get('submission_channel')}",
+            inline=False
+        )
+
+        embed.add_field(
+            name="Approval System",
+            value=f"In-memory: {memory_form.get('enable_approval', False)}\nIn file: {file_form.get('enable_approval', False)}",
+            inline=False
+        )
+
+        # Show button locations
+        memory_buttons = len(memory_form.get("button_locations", []))
+        file_buttons = len(file_form.get("button_locations", []))
+        embed.add_field(
+            name="Button Deployments",
+            value=f"In-memory: {memory_buttons}\nIn file: {file_buttons}",
+            inline=False
+        )
+
+        # If there's a discrepancy, offer to fix it
+        if memory_form != file_form:
+            embed.add_field(
+                name="⚠️ Discrepancy Detected",
+                value="The in-memory form data doesn't match the file data. Use `/form reload` to update.",
+                inline=False
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="reload")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reload_forms(self, interaction: discord.Interaction):
+        """Reloads all forms from the database file"""
+        try:
+            # Reload forms from file
+            self.forms = load_forms()
+            self.bot.forms = self.forms
+
+            # Re-register persistent views
+            self.register_persistent_views()
+
+            await interaction.response.send_message(
+                "Forms have been reloaded from the database file.",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"Error reloading forms: {e}")
+            import traceback
+            traceback.print_exc()
+            await interaction.response.send_message(
+                f"An error occurred while reloading forms: {str(e)}",
+                ephemeral=True
+            )
+
+
+async def setup(bot):
+    # Check if we already have a cog instance
+    existing_cog = bot.get_cog("Formcall")
+    if existing_cog:
+        # If we do, remove it first to prevent duplicate handlers
+        await bot.remove_cog("Formcall")
+
+    # Create a custom handler that we can reference later
+    async def approval_button_handler(interaction):
+        if interaction.type == discord.InteractionType.component:
+            custom_id = interaction.data.get('custom_id', '')
+            # Handle approval buttons
+            if custom_id.startswith('approve:') or custom_id.startswith('deny:'):
+                parts = custom_id.split(':')
+                if len(parts) >= 3:
+                    action = parts[0]  # 'approve' or 'deny'
+                    form_name = parts[1]
+                    submission_id = parts[2]
+                    # Create a view with the extracted data
+                    view = ApprovalView(form_name, submission_id)
+                    # Call the appropriate callback
+                    if action == 'approve':
+                        await view.approve_callback(interaction)
+                    else:
+                        await view.deny_callback(interaction)
+                    return
+
+    # Store the handler on the bot for future reference
+    if hasattr(bot, '_approval_handler'):
+        # Remove the old handler if it exists
+        bot.remove_listener(bot._approval_handler, 'on_interaction')
+
+    # Add the new handler and store it
+    bot.add_listener(approval_button_handler, 'on_interaction')
+    bot._approval_handler = approval_button_handler
+
+    # Now add the cog
+    await bot.add_cog(Formcall(bot))
