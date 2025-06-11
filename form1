@@ -1,0 +1,547 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+from discord.ui import Modal, TextInput, Button, View
+from datetime import datetime
+from discord import TextStyle
+import pytz
+import json
+import os
+import shlex
+import traceback
+import logging
+import asyncio
+import inspect
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("formcall")
+
+# Disable loggers for libraries that are too verbose
+logging.getLogger('discord').setLevel(logging.ERROR)
+logging.getLogger('discord.http').setLevel(logging.ERROR)
+logging.getLogger('discord.gateway').setLevel(logging.ERROR)
+
+# Ensure the databases directory exists
+if not os.path.exists("databases"):
+    os.makedirs("databases")
+
+FORMS_FILE = "databases/forms.json"
+
+
+def load_forms():
+    """Load forms from the JSON file"""
+    if os.path.exists(FORMS_FILE):
+        with open(FORMS_FILE, "r") as f:
+            forms = json.load(f)
+    else:
+        forms = {}
+    # Initialize 'button_locations' if it doesn't exist
+    for guild_id in forms:
+        for form_name in forms[guild_id]:
+            if 'button_locations' not in forms[guild_id][form_name]:
+                forms[guild_id][form_name]['button_locations'] = []
+            if 'enable_approval' not in forms[guild_id][form_name]:
+                forms[guild_id][form_name]['enable_approval'] = False
+    return forms
+
+
+def save_forms(forms):
+    """Save forms to the JSON file"""
+    try:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(FORMS_FILE), exist_ok=True)
+
+        # Save to a temporary file first
+        temp_file = f"{FORMS_FILE}.temp"
+        with open(temp_file, "w") as f:
+            json.dump(forms, f, indent=4)
+
+        # Validate the JSON by reading it back
+        with open(temp_file, "r") as f:
+            json.load(f)  # This will raise an exception if the JSON is invalid
+
+        # Then rename to the actual file (atomic operation)
+        import shutil
+        shutil.move(temp_file, FORMS_FILE)
+
+        print(f"Forms saved successfully to {FORMS_FILE}")
+        return True
+    except Exception as e:
+        print(f"Error saving forms: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+class ApprovalView(View):
+    def __init__(self, form_name, submission_id):
+        super().__init__(timeout=None)  # Set timeout to None for persistence
+        self.form_name = form_name
+        self.submission_id = submission_id
+        # Remove the existing buttons so we can add our custom ones
+        # This prevents duplicate buttons when we add our custom ones
+        self.clear_items()
+        # Add buttons with context-encoded custom_ids
+        approve_button = Button(
+            label="Approve",
+            style=discord.ButtonStyle.green,
+            custom_id=f"approve:{form_name}:{submission_id}"
+        )
+        approve_button.callback = self.approve_callback
+        self.add_item(approve_button)
+        deny_button = Button(
+            label="Deny",
+            style=discord.ButtonStyle.red,
+            custom_id=f"deny:{form_name}:{submission_id}"
+        )
+        deny_button.callback = self.deny_callback
+        self.add_item(deny_button)
+
+    async def approve_callback(self, button_interaction: discord.Interaction):
+        # Extract context from custom_id if needed
+        if not hasattr(self, 'form_name') or not hasattr(self, 'submission_id'):
+            custom_id_parts = button_interaction.data['custom_id'].split(':')
+            if len(custom_id_parts) >= 3:
+                self.form_name = custom_id_parts[1]
+                self.submission_id = custom_id_parts[2]
+
+        # Check if the user has permission to approve
+        if not button_interaction.user.guild_permissions.manage_messages:
+            # Check if the interaction has already been responded to
+            if not button_interaction.response.is_done():
+                await button_interaction.response.send_message(
+                    "You don't have permission to approve submissions.",
+                    ephemeral=True
+                )
+            else:
+                await button_interaction.followup.send(
+                    "You don't have permission to approve submissions.",
+                    ephemeral=True
+                )
+            return
+
+        # Create a modal for selecting roles
+        class RoleSelectionModal(Modal):
+            def __init__(self, form_name, submission_id, parent_view):
+                super().__init__(title="Approved Roles")
+                self.form_name = form_name
+                self.submission_id = submission_id
+                self.parent_view = parent_view  # Store reference to parent view
+                self.roles = TextInput(
+                    label="Roles to assign (comma separated)",
+                    placeholder="e.g. Member, Verified, etc.",
+                    required=False,
+                    style=TextStyle.short
+                )
+                self.add_item(self.roles)
+
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                try:
+                    roles_text = self.roles.value.strip()
+                    approved_roles = [role.strip() for role in roles_text.split(',')] if roles_text else []
+
+                    # Get the submission message
+                    channel = button_interaction.channel
+                    parent_channel = channel
+
+                    # If we're in a thread, get the parent channel
+                    if isinstance(channel, discord.Thread):
+                        parent_channel = channel.parent
+
+                    try:
+                        # Try to get the original message
+                        submission_message = await parent_channel.fetch_message(int(self.submission_id))
+
+                        # Get the user from the embed
+                        embed = submission_message.embeds[0]
+                        user_id = int(embed.footer.text.split(": ")[1])
+                        user = button_interaction.guild.get_member(user_id)
+
+                        # Add roles to the user
+                        added_roles = []
+                        failed_roles = []
+
+                        if user and approved_roles:
+                            for role_name in approved_roles:
+                                role = discord.utils.get(button_interaction.guild.roles, name=role_name)
+                                if role:
+                                    try:
+                                        await user.add_roles(role, reason=f"Approved in {self.form_name} form")
+                                        added_roles.append(role.name)
+                                    except discord.Forbidden:
+                                        failed_roles.append(f"{role.name} (missing permissions)")
+                                    except Exception as e:
+                                        failed_roles.append(f"{role.name} ({str(e)})")
+                                else:
+                                    failed_roles.append(f"{role_name} (role not found)")
+
+                        # Create a summary embed
+                        summary_embed = discord.Embed(
+                            title="Application Approved",
+                            description=(
+                                f"**Submission:** {user.name if user else 'Unknown User'} ({user_id})\n"
+                                f"**Status:** Approved by {button_interaction.user.mention}\n"
+                                f"**Timestamp:** {discord.utils.format_dt(datetime.now(), 'F')}"
+                            ),
+                            color=discord.Color.green()
+                        )
+
+                        # Add role information to the summary
+                        if added_roles:
+                            summary_embed.add_field(
+                                name="Added Roles",
+                                value=", ".join(added_roles),
+                                inline=False
+                            )
+
+                        if failed_roles:
+                            summary_embed.add_field(
+                                name="Failed Roles",
+                                value="\n".join(failed_roles),
+                                inline=False
+                            )
+
+                        # If we're in a thread, send the summary there
+                        if isinstance(channel, discord.Thread):
+                            await channel.send(embed=summary_embed)
+                        else:
+                            # If not in a thread, create a reply to the submission
+                            await submission_message.reply(embed=summary_embed)
+
+                        # Update the original submission
+                        embed.color = discord.Color.green()
+                        embed.add_field(
+                            name="Status",
+                            value=f"Approved by {button_interaction.user.mention} on {discord.utils.format_dt(datetime.now(), 'F')}",
+                            inline=False
+                        )
+
+                        if added_roles:
+                            embed.add_field(
+                                name="Approved Roles",
+                                value=", ".join(added_roles),
+                                inline=False
+                            )
+
+                        if failed_roles:
+                            embed.add_field(
+                                name="Failed Roles",
+                                value="\n".join(failed_roles),
+                                inline=False
+                            )
+
+                        await submission_message.edit(embed=embed, view=None)
+
+                        # Notify the user
+                        if user:
+                            roles_msg = ""
+                            if added_roles:
+                                roles_msg += f"\nYou have been approved for the following roles: {', '.join(added_roles)}"
+
+                            try:
+                                await user.send(
+                                    f"Your {self.form_name} submission has been **approved**!{roles_msg}")
+                            except:
+                                if isinstance(channel, discord.Thread):
+                                    await channel.send("Note: Could not DM the user about the approval.")
+                                else:
+                                    await submission_message.reply("Note: Could not DM the user about the approval.")
+
+                        await modal_interaction.response.send_message("Submission approved!", ephemeral=True)
+
+                    except Exception as e:
+                        print(f"Error in approval process: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        await modal_interaction.response.send_message(
+                            f"An error occurred during approval: {str(e)}",
+                            ephemeral=True
+                        )
+
+                except Exception as e:
+                    print(f"Error in role selection modal: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await modal_interaction.response.send_message(
+                        f"An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+
+        # Try to send the modal, handling the case where the interaction might already be acknowledged
+        try:
+            if not button_interaction.response.is_done():
+                await button_interaction.response.send_modal(
+                    RoleSelectionModal(self.form_name, self.submission_id, self)
+                )
+            else:
+                # If the interaction is already acknowledged, we need to use a different approach
+                # For now, we'll send a message asking the user to try again
+                await button_interaction.followup.send(
+                    "There was an issue processing your request. Please try clicking the button again.",
+                    ephemeral=True
+                )
+        except discord.errors.HTTPException as e:
+            if e.code == 40060:  # Interaction has already been acknowledged
+                await button_interaction.followup.send(
+                    "There was an issue processing your request. Please try clicking the button again.",
+                    ephemeral=True
+                )
+            else:
+                # Re-raise other HTTP exceptions
+                raise
+
+    async def deny_callback(self, button_interaction: discord.Interaction):
+        # Extract context from custom_id if needed
+        if not hasattr(self, 'form_name') or not hasattr(self, 'submission_id'):
+            custom_id_parts = button_interaction.data['custom_id'].split(':')
+            if len(custom_id_parts) >= 3:
+                self.form_name = custom_id_parts[1]
+                self.submission_id = custom_id_parts[2]
+
+        # Check if the user has permission to deny
+        if not button_interaction.user.guild_permissions.manage_messages:
+            await button_interaction.response.send_message(
+                "You don't have permission to deny submissions.",
+                ephemeral=True
+            )
+            return
+
+        class DenialReasonModal(Modal):
+            def __init__(self, form_name, submission_id, parent_view):
+                super().__init__(title="Denial Reason")
+                self.form_name = form_name
+                self.submission_id = submission_id
+                self.parent_view = parent_view  # Store reference to parent view
+
+                self.reason = TextInput(
+                    label="Reason for Denial",
+                    style=TextStyle.paragraph,
+                    required=True
+                )
+                self.add_item(self.reason)
+
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                try:
+                    reason = self.reason.value
+
+                    # Get the submission message
+                    channel = button_interaction.channel
+                    parent_channel = channel
+
+                    # If we're in a thread, get the parent channel
+                    if isinstance(channel, discord.Thread):
+                        parent_channel = channel.parent
+
+                    try:
+                        # Try to get the original message
+                        submission_message = await parent_channel.fetch_message(int(self.submission_id))
+
+                        # Get the user from the embed
+                        embed = submission_message.embeds[0]
+                        user_id = int(embed.footer.text.split(": ")[1])
+                        user = button_interaction.guild.get_member(user_id)
+
+                        # Create a summary embed
+                        summary_embed = discord.Embed(
+                            title="Application Denied",
+                            description=(
+                                f"**Submission:** {user.name if user else 'Unknown User'} ({user_id})\n"
+                                f"**Status:** Denied by {button_interaction.user.mention}\n"
+                                f"**Reason:** {reason}\n"
+                                f"**Timestamp:** {discord.utils.format_dt(datetime.now(), 'F')}"
+                            ),
+                            color=discord.Color.red()
+                        )
+
+                        # If we're in a thread, send the summary there
+                        if isinstance(channel, discord.Thread):
+                            await channel.send(embed=summary_embed)
+                        else:
+                            # If not in a thread, create a reply to the submission
+                            await submission_message.reply(embed=summary_embed)
+
+                        # Update the original submission
+                        embed.color = discord.Color.red()
+                        embed.add_field(
+                            name="Status",
+                            value=f"Denied by {button_interaction.user.mention} on {discord.utils.format_dt(datetime.now(), 'F')}",
+                            inline=False
+                        )
+                        embed.add_field(
+                            name="Reason",
+                            value=reason,
+                            inline=False
+                        )
+                        await submission_message.edit(embed=embed, view=None)
+
+                        # Notify the user
+                        if user:
+                            try:
+                                await user.send(
+                                    f"Your {self.form_name} submission has been **denied**.\n**Reason:** {reason}")
+                            except:
+                                if isinstance(channel, discord.Thread):
+                                    await channel.send("Note: Could not DM the user about the denial.")
+                                else:
+                                    await submission_message.reply("Note: Could not DM the user about the denial.")
+
+                        await modal_interaction.response.send_message("Submission denied!", ephemeral=True)
+                    except Exception as e:
+                        print(f"Error in denial process: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        await modal_interaction.response.send_message(
+                            f"An error occurred during denial: {str(e)}",
+                            ephemeral=True
+                        )
+                except Exception as e:
+                    print(f"Error in denial reason modal: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await modal_interaction.response.send_message(
+                        f"An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+
+        # Send the modal with the necessary context
+        await button_interaction.response.send_modal(
+            DenialReasonModal(self.form_name, self.submission_id, self)
+        )
+
+
+class DynamicModal(Modal):
+    # Store continue message IDs at the class level
+    continue_message_ids = {}
+
+    def __init__(self, title, questions, submission_channel_id, enable_approval, form_name, page=0,
+                 previous_answers=None, user_id=None, display_title=None):
+        super().__init__(title=f"{title} (Page {page + 1})")
+        self.submission_channel_id = submission_channel_id
+        self.enable_approval = enable_approval
+        self.form_name = form_name
+        self.display_title = display_title or title  # Store the display title
+        self.all_questions = questions
+        self.page = page
+        self.previous_answers = previous_answers or []
+        self.user_id = user_id or 0  # Will be set in on_submit if not provided
+
+        # Calculate which questions to show on this page
+        start = page * 5
+        end = min(start + 5, len(questions))
+        self.current_questions = questions[start:end]
+
+        # Add text inputs for each question
+        for idx, question in enumerate(self.current_questions):
+            question_number = start + idx + 1
+            self.add_item(self.create_text_input(idx, question_number, question))
+
+    def create_text_input(self, idx, question_number, question):
+        """Create a text input for a question"""
+        if len(question) <= 45:
+            # Short question: use it as the label
+            return TextInput(
+                label=question,
+                placeholder="Your answer here...",
+                required=True,
+                style=TextStyle.short
+            )
+        else:
+            # Long question: use a short label and put the full question in the placeholder
+            truncated_question = self.format_long_question(question)
+            return TextInput(
+                label=f"Question {question_number}",
+                placeholder=truncated_question,
+                required=True,
+                style=TextStyle.paragraph  # Use paragraph for longer inputs
+            )
+
+    def format_long_question(self, question):
+        """Format a long question to fit within Discord's limits"""
+        words = question.split()
+        lines = []
+        current_line = []
+        for word in words:
+            if len(' '.join(current_line + [word])) > 100:  # Discord's character limit for placeholders
+                lines.append(' '.join(current_line))
+                current_line = [word]
+            else:
+                current_line.append(word)
+        if current_line:
+            lines.append(' '.join(current_line))
+        return '\n'.join(lines)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle form submission"""
+        try:
+            logger.info(f"Form submitted for {self.form_name}, page {self.page + 1}")
+
+            # Set user_id if not already set
+            if not self.user_id:
+                self.user_id = interaction.user.id
+
+            # Delete previous continue messages for this user
+            if self.user_id in DynamicModal.continue_message_ids:
+                try:
+                    channel = interaction.channel
+                    for message_id in DynamicModal.continue_message_ids[self.user_id]:
+                        try:
+                            previous_message = await channel.fetch_message(message_id)
+                            await previous_message.delete()
+                            logger.info(f"Deleted previous continue message: {message_id}")
+                        except discord.NotFound:
+                            logger.info(f"Message {message_id} already deleted or not found")
+                        except Exception as e:
+                            logger.error(f"Failed to delete message {message_id}: {e}")
+
+                    # Clear the list after attempting to delete all messages
+                    DynamicModal.continue_message_ids[self.user_id] = []
+                except Exception as e:
+                    logger.error(f"Error deleting previous messages: {e}")
+
+            # Collect answers from this page
+            new_answers = [child.value for child in self.children]
+            all_answers = self.previous_answers + new_answers
+            logger.info(f"Current answers: {new_answers}")
+            logger.info(f"All answers so far: {all_answers}")
+
+            # Check if there are more pages
+            if (self.page + 1) * 5 < len(self.all_questions):
+                logger.info(f"More questions remaining. Preparing for next page.")
+
+                # Send a new continue message
+                continue_view = self.get_continue_view(all_answers)
+                await interaction.response.send_message(
+                    "Click 'Continue' to proceed to the next page.",
+                    ephemeral=True,
+                    view=continue_view
+                )
+
+                # Store the message ID for later deletion
+                # We need to wait for the response to be sent before we can get the message ID
+                await asyncio.sleep(0.5)  # Small delay to ensure the message is sent
+
+                # Try to get the message ID from the response
+                if hasattr(interaction, 'original_response'):
+                    message = await interaction.original_response()
+
+                    # Initialize the list for this user if it doesn't exist
+                    if self.user_id not in DynamicModal.continue_message_ids:
+                        DynamicModal.continue_message_ids[self.user_id] = []
+
+                    # Add this message ID to the list
+                    DynamicModal.continue_message_ids[self.user_id].append(message.id)
+                    logger.info(f"Stored continue message ID: {message.id} for user {self.user_id}")
+            else:
+                logger.info("Processing final submission")
+                await self.process_submission(interaction, all_answers)
+
+                # Clear any stored message IDs for this user after final submission
+                if self.user_id in DynamicModal.continue_message_ids:
+                    DynamicModal.continue_message_ids[self.user_id] = []
+        except Exception as e:
+            logger.error(f"Error in on_submit: {e}\n{traceback.format_exc()}")
+            await interaction.response.send_message(
+                "An error occurred while processing your submission. Please try again.",
+                ephemeral=True
+            )
