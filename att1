@@ -1,0 +1,423 @@
+import asyncio
+import csv
+import discord
+import io
+import json
+import os
+import pytz
+import shutil
+import re
+import datetime
+import copy
+import glob
+import logging
+import time
+import gspread
+from google.oauth2.service_account import Credentials
+from dateutil.rrule import rrulestr
+from datetime import datetime, timedelta
+from discord import app_commands
+from discord.ext import commands, tasks
+from pytz import timezone
+from discord.ui import Button, View
+from typing import Dict, List, Optional, Union
+import sqlite3
+
+# Constants
+PASTEL_BLUE = 0x9DB2FF
+PASTEL_RED = 0xFF9D9D
+PASTEL_GREEN = 0x9DFFB2
+DATA_FOLDER = "data"
+
+logger = logging.getLogger(__name__)
+
+
+class AttendanceTracker:
+    def __init__(self):
+        # Existing JSON-based storage
+        self.data_file = os.path.join("data", "attendance_records.json")
+        os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+
+        self.attendance_data = {
+            "records": [],
+            "last_id": 0
+        }
+
+        # Load existing data
+        self.load_data()
+
+        # Google Sheets setup
+        self.sheets_cache = {}  # Cache sheets by guild_id
+        self.gc = None
+        self.sheets_enabled = False
+        self.setup_google_auth()
+
+    def setup_google_auth(self):
+        """Set up Google authentication (one time)"""
+        try:
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"
+            ]
+
+            creds_file = "google_credentials.json"
+
+            if os.path.exists(creds_file):
+                creds = Credentials.from_service_account_file(creds_file, scopes=scope)
+                self.gc = gspread.authorize(creds)
+                self.sheets_enabled = True
+                print("Google Sheets authentication successful")
+            else:
+                print(f"Google credentials file '{creds_file}' not found. Google Sheets integration disabled.")
+                self.sheets_enabled = False
+
+        except Exception as e:
+            print(f"Error setting up Google Sheets authentication: {e}")
+            self.sheets_enabled = False
+
+    def get_sheet_name(self, guild_id, guild_name):
+        """Generate sheet name for a specific guild"""
+        # Clean guild name for use in sheet title
+        clean_name = "".join(c for c in guild_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        return f"Attendance - {clean_name} ({guild_id})"
+
+    async def get_or_create_sheet(self, guild_id, guild_name):
+        """Get or create a sheet for a specific guild"""
+        if not self.sheets_enabled:
+            return None
+
+        # Check cache first
+        if guild_id in self.sheets_cache:
+            return self.sheets_cache[guild_id]
+
+        try:
+            sheet_name = self.get_sheet_name(guild_id, guild_name)
+
+            try:
+                # Try to open existing sheet
+                sheet = self.gc.open(sheet_name).sheet1
+                print(f"Found existing sheet for guild {guild_name}: {sheet_name}")
+
+            except gspread.SpreadsheetNotFound:
+                # Create new sheet
+                print(f"Creating new sheet for guild {guild_name}: {sheet_name}")
+                spreadsheet = self.gc.create(sheet_name)
+                sheet = spreadsheet.sheet1
+
+                # Set up headers
+                headers = [
+                    "Timestamp", "User ID", "Username", "Event ID",
+                    "Event Title", "Role ID", "Role Name", "Action", "Guild ID", "Guild Name"
+                ]
+                sheet.insert_row(headers, 1)
+
+                # Format the header row
+                sheet.format('A1:J1', {
+                    "backgroundColor": {"red": 0.2, "green": 0.6, "blue": 1.0},
+                    "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}
+                })
+
+                print(f"Created new sheet: {sheet_name}")
+                print(f"Sheet URL: {spreadsheet.url}")
+
+            # Cache the sheet
+            self.sheets_cache[guild_id] = sheet
+            return sheet
+
+        except Exception as e:
+            print(f"Error getting/creating sheet for guild {guild_id}: {e}")
+            return None
+
+    async def log_to_google_sheets(self, user_id, username, event_id, event_title, role_id, role_name, action, guild_id,
+                                   guild_name):
+        print(f"🔍 log_to_google_sheets called for {username} in {guild_name}")  # ADD THIS
+
+        if not self.sheets_enabled:
+            print("❌ Sheets not enabled")  # ADD THIS
+            return False
+
+        try:
+            # Get the sheet for this guild
+            sheet = await self.get_or_create_sheet(guild_id, guild_name)
+            if not sheet:
+                return False
+
+            # Get current timestamp in EST
+            est = pytz.timezone('US/Eastern')
+            timestamp = datetime.now(est).strftime("%Y-%m-%d %H:%M:%S EST")
+
+            # Prepare row data
+            row_data = [
+                timestamp,
+                str(user_id),
+                username,
+                str(event_id),
+                event_title,
+                str(role_id),
+                role_name,
+                action,  # "joined" or "left"
+                str(guild_id),
+                guild_name
+            ]
+
+            # Insert the row (at row 2, after headers)
+            sheet.insert_row(row_data, 2)
+            print(f"✅ Successfully logged to sheets for {username}")
+            return True
+        except Exception as e:
+            print(f"❌ Error logging to sheets: {e}")  # ADD THIS
+            return False
+
+    def get_sheet_url(self, guild_id):
+        """Get the URL for a guild's sheet"""
+        if guild_id in self.sheets_cache:
+            return self.sheets_cache[guild_id].spreadsheet.url
+        return None
+
+    def clear_cache(self):
+        """Clear the sheets cache (useful for testing)"""
+        self.sheets_cache.clear()
+
+    def load_data(self):
+        """Load attendance data from file"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r') as f:
+                    loaded_data = json.load(f)
+
+                    # Ensure the loaded data has the required structure
+                    if isinstance(loaded_data, dict) and "records" in loaded_data and "last_id" in loaded_data:
+                        self.attendance_data = loaded_data
+                    else:
+                        # Convert old format to new format if needed
+                        if isinstance(loaded_data, list):
+                            # Old format was just a list of records
+                            self.attendance_data = {
+                                "records": loaded_data,
+                                "last_id": len(loaded_data)
+                            }
+                        else:
+                            # Initialize with default structure
+                            self.attendance_data = {
+                                "records": [],
+                                "last_id": 0
+                            }
+                        print("Converted attendance data to new format")
+                        self.save_data()
+        except Exception as e:
+            print(f"Error loading attendance data: {e}")
+            # Initialize with empty structure
+            self.attendance_data = {
+                "records": [],
+                "last_id": 0
+            }
+            self.save_data()
+
+    def save_data(self):
+        """Save attendance data to file"""
+        try:
+            with open(self.data_file, 'w') as f:
+                json.dump(self.attendance_data, f, indent=4)
+            return True
+        except Exception as e:
+            print(f"Error saving attendance data: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def record_attendance(self, guild_id, user_id, event_id, event_title, event_time, role_id, role_name):
+        """Record a user's attendance for an event"""
+        try:
+            # Check if this attendance record already exists
+            for record in self.attendance_data["records"]:
+                if (record["guild_id"] == str(guild_id) and
+                        record["user_id"] == str(user_id) and
+                        record["event_id"] == str(event_id) and
+                        record["role_id"] == str(role_id)):
+                    # Already exists, update it
+                    record["role_name"] = role_name
+                    record["event_title"] = event_title
+                    record["event_time"] = event_time
+                    record["timestamp"] = datetime.now().isoformat()
+                    self.save_data()
+                    return True
+
+            # Create a new record
+            record = {
+                "id": self.attendance_data["last_id"] + 1,
+                "guild_id": str(guild_id),
+                "user_id": str(user_id),
+                "event_id": str(event_id),
+                "event_title": event_title,
+                "event_time": event_time,
+                "role_id": str(role_id),
+                "role_name": role_name,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Add to records and update last_id
+            self.attendance_data["records"].append(record)
+            self.attendance_data["last_id"] += 1
+
+            # Save to file
+            self.save_data()
+            return True
+        except Exception as e:
+            print(f"Error recording attendance: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def delete_attendance(self, guild_id, user_id, event_id, role_id):
+        """Delete a user's attendance record"""
+        try:
+            # Find the record to delete
+            for i, record in enumerate(self.attendance_data["records"]):
+                if (record["guild_id"] == str(guild_id) and
+                        record["user_id"] == str(user_id) and
+                        record["event_id"] == str(event_id) and
+                        record["role_id"] == str(role_id)):
+                    # Remove the record
+                    self.attendance_data["records"].pop(i)
+                    self.save_data()
+                    return True
+            return False
+        except Exception as e:
+            print(f"Error deleting attendance: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def update_attendance(self, guild_id, event_id, user_id, role_id, role_name, event_title, event_time,
+                                old_role_id=None):
+        """Update a user's attendance record"""
+        try:
+            # First delete the old record
+            if old_role_id:
+                await self.delete_attendance(guild_id, user_id, event_id, old_role_id)
+            else:
+                await self.delete_attendance(guild_id, user_id, event_id, role_id)
+
+            # Then create a new one
+            return await self.record_attendance(
+                guild_id=guild_id,
+                user_id=user_id,
+                event_id=event_id,
+                event_title=event_title,
+                event_time=event_time,
+                role_id=role_id,
+                role_name=role_name
+            )
+        except Exception as e:
+            print(f"Error updating attendance: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def get_user_attendance(self, guild_id, user_id):
+        """Get all attendance records for a user in a guild"""
+        try:
+            records = []
+            for record in self.attendance_data["records"]:
+                if record["guild_id"] == str(guild_id) and record["user_id"] == str(user_id):
+                    records.append(record)
+            return records
+        except Exception as e:
+            print(f"Error getting user attendance: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    async def get_event_attendance(self, guild_id, event_id):
+        """Get all attendance records for an event"""
+        try:
+            records = []
+            for record in self.attendance_data["records"]:
+                if record["guild_id"] == str(guild_id) and record["event_id"] == str(event_id):
+                    records.append(record)
+            return records
+        except Exception as e:
+            print(f"Error getting event attendance: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def get_guild_attendance_stats(self, guild_id, days=30):
+        """Get attendance statistics for a guild"""
+        try:
+            # Convert to string
+            guild_id = str(guild_id)
+
+            # Calculate the date threshold
+            threshold_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            # Find all records for this guild within the time period
+            guild_records = [
+                record for record in self.attendance_data["records"]
+                if record["guild_id"] == guild_id and
+                   record.get("event_time", "").split(" ")[0] >= threshold_date
+            ]
+
+            # Get unique events and users
+            unique_events = set()
+            unique_users = set()
+            event_attendance = {}  # event_id -> list of user_ids
+            user_attendance = {}  # user_id -> list of event_ids
+
+            for record in guild_records:
+                event_id = record.get("event_id")
+                user_id = record.get("user_id")
+                event_title = record.get("event_title", "Unknown")
+
+                if event_id and user_id:
+                    unique_events.add(event_id)
+                    unique_users.add(user_id)
+
+                    # Track which users attended which events
+                    if event_id not in event_attendance:
+                        event_attendance[event_id] = {
+                            "title": event_title,
+                            "users": set()
+                        }
+                    event_attendance[event_id]["users"].add(user_id)
+
+                    # Track which events each user attended
+                    if user_id not in user_attendance:
+                        user_attendance[user_id] = set()
+                    user_attendance[user_id].add(event_id)
+
+            # Get most active users
+            most_active_users = sorted(
+                [{"user_id": user_id, "event_count": len(events)}
+                 for user_id, events in user_attendance.items()],
+                key=lambda x: x["event_count"],
+                reverse=True
+            )[:5]
+
+            # Get most popular events
+            most_popular_events = sorted(
+                [{"event_id": event_id, "event_title": data["title"], "user_count": len(data["users"])}
+                 for event_id, data in event_attendance.items()],
+                key=lambda x: x["user_count"],
+                reverse=True
+            )[:5]
+
+            # Format the statistics
+            stats = {
+                "total_events": len(unique_events),
+                "total_attendees": len(unique_users),
+                "most_active_users": most_active_users,
+                "most_popular_events": most_popular_events
+            }
+
+            return stats
+        except Exception as e:
+            print(f"Error getting guild attendance stats: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "total_events": 0,
+                "total_attendees": 0,
+                "most_active_users": [],
+                "most_popular_events": []
+            }
