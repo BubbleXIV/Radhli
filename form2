@@ -1,0 +1,471 @@
+    def get_continue_view(self, all_answers):
+        """Create a view with a continue button for multi-page forms"""
+
+        class ContinueView(discord.ui.View):
+            def __init__(self, modal):
+                super().__init__()
+                self.modal = modal
+
+            @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
+            async def continue_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                # Create the next modal
+                next_modal = DynamicModal(
+                    self.modal.title.split('(')[0].strip(),
+                    self.modal.all_questions,
+                    self.modal.submission_channel_id,
+                    self.modal.enable_approval,
+                    self.modal.form_name,
+                    self.modal.page + 1,
+                    all_answers,
+                    self.modal.user_id,  # Pass the user ID to the next modal
+                    self.modal.display_title  # Pass the display title to the next modal
+                )
+
+                # Send the next modal
+                await button_interaction.response.send_modal(next_modal)
+
+        return ContinueView(self)
+
+    async def process_submission(self, interaction: discord.Interaction, answers):
+        """Process the final form submission"""
+        try:
+            # Format the answers with questions and add extra spacing
+            formatted_answers = "\n\n".join([
+                f"**Q{idx + 1}: {question}**\n{answer}"
+                for idx, (question, answer) in enumerate(zip(self.all_questions, answers))
+            ])
+
+            # Use the display title for the submission
+            form_title = self.display_title
+
+            # Create the submission embed
+            embed = discord.Embed(
+                title=f"{interaction.user.name}'s {form_title} Submission",
+                description=formatted_answers,
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
+            )
+
+            # Add user information
+            embed.set_author(name=interaction.user.name, icon_url=interaction.user.display_avatar.url)
+            embed.set_footer(text=f"User ID: {interaction.user.id}")
+
+            # Get the submission channel
+            channel = interaction.guild.get_channel(self.submission_channel_id)
+            if not channel:
+                await interaction.response.send_message("Submission channel not found.", ephemeral=True)
+                return
+
+            # Send the submission without a view first
+            submission_message = await channel.send(embed=embed)
+
+            # Create a thread for discussion
+            thread = await submission_message.create_thread(
+                name=f"{interaction.user.name}'s {form_title} submission",
+                auto_archive_duration=1440  # 24 hours
+            )
+
+            # Add approval buttons if enabled
+            if self.enable_approval:
+                # Create a persistent approval view with the submission message ID
+                approval_view = ApprovalView(self.form_name, str(submission_message.id))
+                # Send the approval view in the thread
+                await thread.send("Please review this submission:", view=approval_view)
+                # Also add the view to the original message
+                await submission_message.edit(view=approval_view)
+
+            # Notify the user that their submission was received
+            await interaction.response.send_message(
+                "Your submission has been recorded. Thank you!",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in process_submission: {e}\n{traceback.format_exc()}")
+            error_message = f"An error occurred while processing your submission. Please try again."
+            if not interaction.response.is_done():
+                await interaction.response.send_message(error_message, ephemeral=True)
+            else:
+                await interaction.followup.send(error_message, ephemeral=True)
+
+
+class PersistentFormView(discord.ui.View):
+    def __init__(self, form_name: str, enable_approval: bool, display_title: str = None):
+        super().__init__(timeout=None)
+        self.form_name = form_name
+        self.enable_approval = enable_approval
+        self.display_title = display_title or form_name  # Use the provided title or fall back to form_name
+
+        # Clear existing items and add our custom button
+        self.clear_items()
+        open_button = discord.ui.Button(
+            label="Open Form",
+            style=discord.ButtonStyle.green,
+            custom_id=f"open_form:{form_name}"
+        )
+        open_button.callback = self.open_form
+        self.add_item(open_button)
+
+    @classmethod
+    def from_form_data(cls, form_name: str, form_data: dict):
+        enable_approval = form_data.get('enable_approval', False)
+        display_title = form_data.get('display_title', form_name)
+        return cls(form_name, enable_approval, display_title)
+
+    async def open_form(self, interaction: discord.Interaction):
+        try:
+            logger.info(f"Opening form: {self.form_name}")
+            guild_id = str(interaction.guild.id)
+            # Load the latest form data
+            forms = load_forms()
+            if guild_id not in forms or self.form_name not in forms[guild_id]:
+                await interaction.response.send_message("Form not found. Please try again later.", ephemeral=True)
+                return
+
+            form_data = forms[guild_id][self.form_name]
+            if "questions" not in form_data or "submission_channel" not in form_data:
+                await interaction.response.send_message("Form data is incomplete. Please try again later.",
+                                                        ephemeral=True)
+                return
+
+            # Fix: Properly extract the form data
+            questions = form_data["questions"]
+            submission_channel_id = form_data["submission_channel"]
+            enable_approval = form_data.get("enable_approval", False)
+            display_title = form_data.get("display_title", self.form_name)
+
+            modal = DynamicModal(
+                title=display_title,  # Use the display title
+                questions=questions,
+                submission_channel_id=submission_channel_id,
+                enable_approval=enable_approval,
+                form_name=self.form_name,  # Internal form name for reference
+                display_title=display_title,  # Pass the display title
+                page=0,
+                previous_answers=[]
+            )
+
+            logger.info("Modal created, sending to user")
+            await interaction.response.send_modal(modal)
+            logger.info("Modal sent successfully")
+        except Exception as e:
+            logger.error(f"Error in open_form: {e}\n{traceback.format_exc()}")
+            await interaction.response.send_message(
+                "An error occurred while opening the form. Please try again.",
+                ephemeral=True
+            )
+
+
+class BulkQuestionsModal(Modal):
+    def __init__(self, form_name):
+        super().__init__(title=f"Add Questions to {form_name}")
+        self.form_name = form_name
+        self.questions = TextInput(
+            label="Enter questions (one per line)",
+            style=TextStyle.paragraph,
+            placeholder="Enter each question on a new line",
+            required=True
+        )
+        self.add_item(self.questions)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            # Parse the questions from the text input
+            questions_text = self.questions.value
+            questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
+            if not questions_list:
+                await interaction.response.send_message("No valid questions were provided.", ephemeral=True)
+                return
+
+            # Debug info
+            print(f"Adding {len(questions_list)} questions to form '{self.form_name}'")
+            print(f"Questions to add: {questions_list}")
+
+            # Get the guild ID
+            guild_id = str(interaction.guild.id)
+            print(f"Guild ID: {guild_id}")
+
+            # Load the current forms data directly from file to ensure we have the latest
+            forms = load_forms()
+            print(f"Forms loaded from file: {forms.get(guild_id, {}).get(self.form_name, {})}")
+
+            # Check if the form exists
+            if guild_id not in forms or self.form_name not in forms[guild_id]:
+                await interaction.response.send_message(f"Form '{self.form_name}' not found.", ephemeral=True)
+                return
+
+            # Ensure the questions list exists
+            if "questions" not in forms[guild_id][self.form_name]:
+                forms[guild_id][self.form_name]["questions"] = []
+
+            # Add the new questions
+            current_questions = forms[guild_id][self.form_name]["questions"]
+            print(f"Current questions before adding: {current_questions}")
+
+            # Directly extend the questions list with the new questions
+            forms[guild_id][self.form_name]["questions"].extend(questions_list)
+            print(f"Updated questions: {forms[guild_id][self.form_name]['questions']}")
+
+            # Save the updated forms data
+            if save_forms(forms):
+                print(f"Forms saved to file")
+
+                # Update the bot's forms cache - this is critical
+                # Get the bot instance from the interaction client
+                bot = interaction.client
+
+                # Update the bot's forms cache and the cog's forms cache
+                if hasattr(bot, 'forms'):
+                    bot.forms = forms
+                    print("Updated bot's forms cache")
+
+                # Find and update the Formcall cog's forms cache
+                for cog_name, cog in bot.cogs.items():
+                    if isinstance(cog, Formcall):
+                        cog.forms = forms
+                        print(f"Updated {cog_name} cog's forms cache")
+            else:
+                print("Failed to save forms")
+
+            # Create a response embed
+            embed = discord.Embed(
+                title="Questions Added",
+                description=f"Added {len(questions_list)} questions to form '{self.form_name}'",
+                color=discord.Color.green()
+            )
+
+            # Add the first few questions as fields
+            max_display = min(10, len(questions_list))
+            for i in range(max_display):
+                embed.add_field(
+                    name=f"Question {len(current_questions) + i + 1}",
+                    value=questions_list[i],
+                    inline=False
+                )
+
+            if len(questions_list) > max_display:
+                embed.add_field(
+                    name="Note",
+                    value=f"{len(questions_list) - max_display} more questions were added but not shown here.",
+                    inline=False
+                )
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            print(f"Error in BulkQuestionsModal.on_submit: {e}")
+            import traceback
+            traceback.print_exc()
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred while adding questions: {str(e)}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred while adding questions: {str(e)}",
+                    ephemeral=True
+                )
+
+
+class Formcall(commands.GroupCog, name="form"):
+    """Cog for creating and managing application forms"""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self._default_permission = discord.Permissions(manage_guild=True)
+        self.forms = load_forms()
+        self.bot.forms = self.forms  # Make forms accessible from the bot
+        self.bot.save_forms = lambda: save_forms(self.forms)  # Add save method to bot
+        # Register persistent views for existing form buttons
+        self.register_persistent_views()
+        super().__init__()
+
+    def register_persistent_views(self):
+        """Register persistent views for all existing form buttons"""
+        # Register form buttons
+        for guild_id, guild_forms in self.forms.items():
+            for form_name, form_data in guild_forms.items():
+                enable_approval = form_data.get('enable_approval', False)
+                view = PersistentFormView(form_name, enable_approval)
+                self.bot.add_view(view)
+                logger.info(f"Registered persistent view for form: {form_name}")
+
+        # Register listeners for approval/denial buttons
+        self.bot.add_view(View(timeout=None))  # Generic view to catch all persistent buttons
+        logger.info("Registered persistent views for approval/denial buttons")
+
+    @app_commands.command(name="create")
+    @app_commands.describe(form_name="Name of the form to create")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def create_form(self, interaction: discord.Interaction, form_name: str):
+        """Creates a new form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id not in self.forms:
+            self.forms[guild_id] = {}
+        if form_name in self.forms[guild_id]:
+            await interaction.response.send_message(
+                f"A form with the name '{form_name}' already exists.",
+                ephemeral=True
+            )
+        else:
+            self.forms[guild_id][form_name] = {
+                "questions": [],
+                "submission_channel": None,
+                "enable_approval": False,
+                "button_locations": []
+            }
+            save_forms(self.forms)
+            embed = discord.Embed(
+                title="Form Created",
+                description=f"Form '{form_name}' created successfully.",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="Next Steps",
+                value=(
+                    "1. Add questions with `/form add_question` or `/form add_questions`\n"
+                    "2. Set submission channel with `/form set_channel`\n"
+                    "3. Deploy the form with `/form deploy`"
+                )
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="add_question")
+    @app_commands.describe(
+        form_name="Name of the form to add a question to",
+        question="The question to add"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def add_question(self, interaction: discord.Interaction, form_name: str, question: str):
+        """Adds a question to the specified form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            self.forms[guild_id][form_name]["questions"].append(question)
+            save_forms(self.forms)
+            # Get the question count
+            question_count = len(self.forms[guild_id][form_name]["questions"])
+            embed = discord.Embed(
+                title="Question Added",
+                description=f"Added question #{question_count} to form '{form_name}':",
+                color=discord.Color.green()
+            )
+            embed.add_field(name=f"Question {question_count}", value=question, inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="add_questions")
+    @app_commands.describe(form_name="Name of the form to add questions to")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def add_questions(self, interaction: discord.Interaction, form_name: str):
+        """Add multiple questions at once to a form"""
+        try:
+            guild_id = str(interaction.guild.id)
+            # Check if the form exists
+            if guild_id not in self.forms or form_name not in self.forms[guild_id]:
+                await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+                return
+            # Create and send the modal
+            modal = BulkQuestionsModal(form_name)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            print(f"Error in add_questions command: {e}")
+            import traceback
+            traceback.print_exc()
+            await interaction.response.send_message(
+                f"An error occurred: {str(e)}",
+                ephemeral=True
+            )
+
+    @app_commands.command(name="view_questions")
+    @app_commands.describe(form_name="Name of the form to view questions for")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def view_questions(self, interaction: discord.Interaction, form_name: str):
+        """Displays the current list of questions for the specified form"""
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            questions = self.forms[guild_id][form_name].get("questions", [])
+            if not questions:
+                await interaction.response.send_message(
+                    f"Form '{form_name}' has no questions yet.",
+                    ephemeral=True
+                )
+                return
+
+            # Create an embed to display the questions
+            embed = discord.Embed(
+                title=f"Questions for '{form_name}'",
+                description=f"Total questions: {len(questions)}",
+                color=discord.Color.blue()
+            )
+
+            # Add questions as fields, up to 25 (Discord's limit)
+            for i, question in enumerate(questions[:25]):
+                embed.add_field(
+                    name=f"Question {i + 1}",
+                    value=question,
+                    inline=False
+                )
+
+            if len(questions) > 25:
+                embed.set_footer(
+                    text=f"Showing 25/{len(questions)} questions. Use /form view_more_questions to see more.")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
+
+    @app_commands.command(name="view_more_questions")
+    @app_commands.describe(
+        form_name="Name of the form to view questions for",
+        page="Page number to view (starts at 1)"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def view_more_questions(self, interaction: discord.Interaction, form_name: str, page: int = 1):
+        """Displays additional pages of questions for the specified form"""
+        if page < 1:
+            await interaction.response.send_message("Page number must be at least 1.", ephemeral=True)
+            return
+
+        guild_id = str(interaction.guild.id)
+        if guild_id in self.forms and form_name in self.forms[guild_id]:
+            questions = self.forms[guild_id][form_name].get("questions", [])
+            if not questions:
+                await interaction.response.send_message(
+                    f"Form '{form_name}' has no questions yet.",
+                    ephemeral=True
+                )
+                return
+
+            # Calculate pagination
+            questions_per_page = 25
+            total_pages = (len(questions) + questions_per_page - 1) // questions_per_page
+            if page > total_pages:
+                await interaction.response.send_message(
+                    f"Invalid page number. Form '{form_name}' has {total_pages} pages of questions.",
+                    ephemeral=True
+                )
+                return
+
+            start_idx = (page - 1) * questions_per_page
+            end_idx = min(start_idx + questions_per_page, len(questions))
+            page_questions = questions[start_idx:end_idx]
+
+            # Create an embed to display the questions
+            embed = discord.Embed(
+                title=f"Questions for '{form_name}' - Page {page}/{total_pages}",
+                description=f"Total questions: {len(questions)}",
+                color=discord.Color.blue()
+            )
+
+            # Add questions as fields
+            for i, question in enumerate(page_questions):
+                embed.add_field(
+                    name=f"Question {start_idx + i + 1}",
+                    value=question,
+                    inline=False
+                )
+
+            embed.set_footer(text=f"Showing questions {start_idx + 1}-{end_idx} of {len(questions)}")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Form '{form_name}' not found.", ephemeral=True)
